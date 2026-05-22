@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TOC Forge - PDF Bookmark Generator</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #0f0f14;
+    color: #e0e0e0;
+    display: flex; justify-content: center; align-items: center;
+    min-height: 100vh; padding: 2rem;
+  }
+  .container { max-width: 520px; width: 100%; display: flex; flex-direction: column; gap: 1.8rem; }
+  h1 {
+    font-size: 1.8rem; font-weight: 600; text-align: center;
+    background: linear-gradient(135deg, #60a5fa, #a78bfa);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+
+  .upload-zone {
+    border: 2px dashed #333; border-radius: 16px; padding: 2.5rem 2rem;
+    text-align: center; cursor: pointer; transition: border-color .2s, background .2s;
+  }
+  .upload-zone:hover, .upload-zone.dragover { border-color: #60a5fa; background: rgba(96,165,250,0.06); }
+  .upload-zone svg { width: 44px; height: 44px; margin-bottom: .8rem; color: #555; }
+  .upload-zone .label { font-size: 1rem; color: #aaa; }
+  .upload-zone .hint { font-size: .78rem; color: #555; margin-top: .3rem; }
+  #file-input { display: none; }
+
+  .section-title { font-size: .85rem; color: #666; font-weight: 500; margin-bottom: .6rem; }
+  .strategy-row { display: flex; gap: .5rem; }
+  .strategy-btn {
+    flex: 1; padding: .6rem .5rem;
+    background: #1a1a24; border: 1px solid #333; border-radius: 8px;
+    color: #999; font-size: .82rem; cursor: pointer; text-align: center;
+    transition: border-color .2s, color .2s, background .2s;
+  }
+  .strategy-btn:hover { border-color: #555; color: #ccc; }
+  .strategy-btn.selected { border-color: #60a5fa; color: #60a5fa; background: rgba(96,165,250,0.08); }
+
+  .api-fields { display: none; flex-direction: column; gap: .5rem; margin-top: .8rem; }
+  .api-fields.visible { display: flex; }
+  .api-fields input {
+    width: 100%; padding: .55rem .7rem;
+    background: #1a1a24; border: 1px solid #333; border-radius: 6px;
+    color: #ccc; font-size: .85rem; outline: none;
+  }
+  .api-fields input:focus { border-color: #60a5fa; }
+
+  .status { display: none; flex-direction: column; align-items: center; gap: 1rem; }
+  .status.active { display: flex; }
+  .spinner {
+    width: 40px; height: 40px;
+    border: 3px solid #222; border-top-color: #60a5fa;
+    border-radius: 50%; animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .status-text { font-size: .95rem; color: #888; }
+  .status-file { font-size: .85rem; color: #555; }
+
+  .error-msg {
+    display: none; padding: .8rem 1rem;
+    background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.25);
+    border-radius: 8px; color: #f87171; font-size: .88rem; text-align: center;
+  }
+  .error-msg.show { display: block; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>TOC Forge</h1>
+
+  <div id="upload-zone" class="upload-zone">
+    <svg fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+      <path d="M12 16V4m0 0L8 8m4-4l4 4M4 20h16"/>
+    </svg>
+    <div class="label">Click to select or drag a PDF here</div>
+    <div class="hint">Generates navigable bookmarks from the table of contents</div>
+  </div>
+  <input id="file-input" type="file" accept=".pdf">
+
+  <div>
+    <div class="section-title">Extraction method</div>
+    <div class="strategy-row" id="strategy-row">
+      <button class="strategy-btn selected" data-value="local_ocr">Pure OCR</button>
+      <button class="strategy-btn" data-value="llm">OCR + Text LLM</button>
+      <button class="strategy-btn" data-value="vllm">Vision LLM</button>
+    </div>
+    <div class="api-fields" id="api-fields">
+      <input type="text" id="api-base-url" placeholder="API Base URL (e.g. https://api.openai.com/v1)">
+      <input type="password" id="api-key" placeholder="API Key">
+    </div>
+  </div>
+
+  <div id="status" class="status">
+    <div class="spinner"></div>
+    <div class="status-text">Extracting table of contents...</div>
+    <div class="status-file" id="status-file"></div>
+  </div>
+
+  <div id="error" class="error-msg"></div>
+</div>
+
+<script>
+  const uploadZone = document.getElementById('upload-zone');
+  const fileInput = document.getElementById('file-input');
+  const statusEl = document.getElementById('status');
+  const statusFile = document.getElementById('status-file');
+  const errorEl = document.getElementById('error');
+  const apiFields = document.getElementById('api-fields');
+  const strategyRow = document.getElementById('strategy-row');
+
+  let currentStrategy = 'local_ocr';
+  let statusTimer = null;
+
+  const STATUS_MESSAGES = [
+    "Extracting table of contents...",
+    "Running layout detection...",
+    "Reading TOC pages...",
+    "Building bookmark tree...",
+    "Almost done...",
+  ];
+
+  // --- strategy selector ---
+  strategyRow.addEventListener('click', e => {
+    const btn = e.target.closest('.strategy-btn');
+    if (!btn) return;
+    strategyRow.querySelectorAll('.strategy-btn').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+    currentStrategy = btn.dataset.value;
+    apiFields.classList.toggle('visible', currentStrategy !== 'local_ocr');
+  });
+
+  // --- upload ---
+  uploadZone.addEventListener('click', () => fileInput.click());
+  uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('dragover'); });
+  uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
+  uploadZone.addEventListener('drop', e => {
+    e.preventDefault();
+    uploadZone.classList.remove('dragover');
+    const file = e.dataTransfer.files[0];
+    if (file) handleFile(file);
+  });
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files[0];
+    if (file) handleFile(file);
+  });
+
+  async function handleFile(file) {
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      showError('Only PDF files are accepted');
+      return;
+    }
+    errorEl.classList.remove('show');
+    uploadZone.style.display = 'none';
+    statusEl.classList.add('active');
+    statusFile.textContent = file.name;
+
+    let msgIdx = 0;
+    document.querySelector('.status-text').textContent = STATUS_MESSAGES[0];
+    statusTimer = setInterval(() => {
+      msgIdx = (msgIdx + 1) % STATUS_MESSAGES.length;
+      document.querySelector('.status-text').textContent = STATUS_MESSAGES[msgIdx];
+    }, 3000);
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('toc_strategy', currentStrategy);
+    if (currentStrategy !== 'local_ocr') {
+      formData.append('api_base_url', document.getElementById('api-base-url').value);
+      formData.append('api_key', document.getElementById('api-key').value);
+    }
+
+    try {
+      const resp = await fetch('/api/bookmark_pdf', { method: 'POST', body: formData });
+      if (!resp.ok) {
+        const err = await resp.json();
+        throw new Error(err.detail || `Server error (${resp.status})`);
+      }
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file.name.replace(/\.pdf$/i, '') + '_bookmarked.pdf';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      showError(e.message);
+    }
+    reset();
+  }
+
+  function showError(msg) {
+    errorEl.textContent = msg;
+    errorEl.classList.add('show');
+  }
+
+  function reset() {
+    clearInterval(statusTimer);
+    statusEl.classList.remove('active');
+    uploadZone.style.display = '';
+  }
+</script>
+</body>
+</html>
