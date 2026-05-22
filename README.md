@@ -1,4 +1,5 @@
 ## TOC Forge
+**[中文版 README](README_zh.md)** | **[English README](README.md)**
 **One-click automatic PDF bookmark generator.**  
 Just drop in a PDF with a table of contents page — get a fully bookmarked PDF instantly. No manual editing, no complex configuration.
 
