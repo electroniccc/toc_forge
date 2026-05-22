@@ -1,5 +1,16 @@
 ## TOC Forge
-An automatic tool for adding bookmarks to PDF files. Just input a PDF and get a bookmarked PDF without any extra configuration.
+**One-click automatic PDF bookmark generator.**  
+Just drop in a PDF with a table of contents page — get a fully bookmarked PDF instantly. No manual editing, no complex configuration.
+
+Built for scanned books, eBooks, research papers, and any PDF that has a directory page but lacks clickable bookmarks.
+
+## ✨ Features
+
+- Fully automatic: OCR + intelligent clustering to extract TOC
+- Multiple modes: Pure local OCR, Local OCR + LLM, Vision LLM
+- Extremely simple one-command workflow
+- Supports Chinese and English PDFs
+- Fast and lightweight
 
 ## Usage
 **Prepare python env**
