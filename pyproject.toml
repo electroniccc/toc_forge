@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toc-forge"
+version = "0.1.0"
+description = "Extract table of contents from PDFs and inject navigable bookmarks"
+requires-python = ">=3.10"
+dependencies = [
+    "paddlepaddle-gpu",
+    "paddleocr",
+    "paddlex[ocr]",
+    "opencv-python",
+    "PyMuPDF",
+    "Pillow",
+    "numpy",
+    "scikit-learn",
+    "openai",
+]
+
+[project.scripts]
+toc-forge = "toc_forge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
