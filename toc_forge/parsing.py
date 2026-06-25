@@ -194,10 +194,23 @@ def _parse_toc_lines(
                 page_num = int(m.group(1))
                 title = re.sub(r"\s*[\(（]\s*\d+\s*[\)）]\s*$", "", title)
 
+        # Fallback: trailing dot-leader + digits glued to title tail
+        # e.g. "1.1 关于机器学习……2" -> title "1.1 关于机器学习", page 2
+        if page_num is None:
+            m = re.search(r"[\.…·]{1,}\s*(\d+)\s*$", title)
+            if m:
+                page_num = int(m.group(1))
+                title = re.sub(r"[\.…·]{1,}\s*\d+\s*$", "", title)
+
         # Re-strip trailing dot leaders exposed after parenthesized-number removal
         title = re.sub(r"[．….·\s]+$", "", title)
 
         if not title:
+            continue
+
+        # Skip page-header artifacts: Roman numeral + optional separator + 目录
+        # e.g. "xviii目录", "xviii|目录"
+        if re.search(r"[IVXLCDMivxlcdm]+\s*[|｜]?\s*(?:目录|目次)", title):
             continue
 
         clean = re.sub(r"[\s\.·…\-]+", "", title)
