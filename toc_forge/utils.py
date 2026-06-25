@@ -189,9 +189,14 @@ def _section_sort_key(title: str) -> tuple:
     cn_sec = re.search(r"第([一二三四五六七八九十]+)节", title)
     if cn_sec:
         return (_cn_to_int(cn_sec.group(1)),)
-    cn_ch = re.search(r"第([一二三四五六七八九十]+)章", title)
+    cn_ch = re.search(r"第([一二三四五六七八九十]+)章(?!习题)", title)
     if cn_ch:
         return (_cn_to_int(cn_ch.group(1)),)
+    ch_ex = re.match(r"^第([一二三四五六七八九十\d]+)章习题", title)
+    if ch_ex:
+        cn = ch_ex.group(1)
+        ch_num = _cn_to_int(cn) if cn[0] in _CN_NUM else int(cn)
+        return (ch_num, 9000)
     ex = re.match(r"^习题(\d+)[-−](\d+)", title)
     if ex:
         return (int(ex.group(1)), int(ex.group(2)))

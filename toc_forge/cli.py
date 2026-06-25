@@ -43,7 +43,14 @@ def main() -> None:
         help="visual LLM or multi-modal LLM, like qwen3.6-flash",
     )
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--hash", action="store_true", help="print input file hash and exit")
     args = parser.parse_args()
+
+    if args.hash and args.input:
+        from .utils import compute_file_hash
+
+        print(f"file_hash: {compute_file_hash(args.input)}")
+        return
 
     if not args.model_dir:
         print("model dir required")
@@ -62,7 +69,7 @@ def main() -> None:
 
     logger.info("toc_strategy=%s", toc_strategy)
 
-    pdf_bookmarks_path, time_cost = bookmark_pdf(
+    pdf_bookmarks_path, time_cost, _ = bookmark_pdf(
         args.input,
         args.output,
         args.model_dir,

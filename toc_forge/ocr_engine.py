@@ -58,10 +58,27 @@ def get_toc_pages(
     for res_i, res in enumerate(results):
         boxes = res["boxes"]
         content_boxes = []
+        para_titles = []
         for box in boxes:
             if box["label"] == "content":
                 content_boxes.append(box)
+            elif box["label"] == "paragraph_title":
+                para_titles.append(box)
         if content_boxes:
+            # Include paragraph_title boxes that sit between content boxes
+            # (or above the first one).  These are often "篇" / "章" headings
+            # that the layout model didn't label as "content".
+            sorted_cbs = sorted(content_boxes, key=lambda cb: cb["coordinate"][1])
+            prev_bottom = -20
+            for cb in sorted_cbs:
+                cb_top = cb["coordinate"][1]
+                between = [
+                    pt for pt in para_titles
+                    if pt["coordinate"][3] <= cb_top + 5
+                    and pt["coordinate"][1] >= prev_bottom - 5
+                ]
+                content_boxes.extend(between)
+                prev_bottom = cb["coordinate"][3]
             content_boxes = deduplicate_content_boxes(content_boxes)
             toc_pages.append({"page": res_i, "content_boxes": content_boxes})
     # pages that may carry printed page numbers

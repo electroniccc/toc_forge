@@ -11,7 +11,7 @@ import fitz
 
 from .llm import build_toc_llm, build_toc_vllm
 from .ocr_engine import get_toc_pages, ocr_number_pages
-from .parsing import reconstruct_toc1, repair_toc_tree
+from .parsing import inherit_page_numbers, reconstruct_toc1, repair_toc_tree
 from .utils import (
     _roman_to_int,
     compute_file_hash,
@@ -51,6 +51,7 @@ def build_toc_local_ocr(
     # per-page level detection + cross-page merge
     toc_tree1 = reconstruct_toc1(toc_results, page_heights)
     toc_tree1 = repair_toc_tree(toc_tree1)
+    toc_tree1 = inherit_page_numbers(toc_tree1)
     if do_debug:
         import json
 
@@ -167,7 +168,7 @@ def bookmark_pdf(
     api_key: str | None = None,
     llm_name: str = "deepseek-v4-flash",
     vllm_name: str = "qwen3.6-35b-a3b",
-) -> tuple[str, float]:
+) -> tuple[str, float, dict]:
     start_time = time.perf_counter()
     pdf_hash = compute_file_hash(input) if cache_dir else None
     doc = fitz.open(input)
@@ -194,7 +195,7 @@ def bookmark_pdf(
     )
     if not toc_pages:
         print("未检测到目录页")
-        return "", 0
+        return "", 0, {}
 
     doc_ori_classify_model = "PP-LCNet_x1_0_doc_ori"
     make_sure_model_exists(model_dir, doc_ori_classify_model)
@@ -277,7 +278,7 @@ def bookmark_pdf(
 
     structure_model = PPStructureV3(
         use_table_recognition=False,
-        use_formula_recognition=True,
+        use_formula_recognition=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
         use_doc_orientation_classify=True,
@@ -316,7 +317,16 @@ def bookmark_pdf(
     pdf_bookmarks_path = os.path.join(output, f"{Path(input).stem}_bookmarked.pdf")
     add_bookmarks_to_pdf(doc, toc_tree1, page_offset, pdf_bookmarks_path)
 
+    def update_page_offset(toc_tree1, page_offset):
+        for item in toc_tree1:
+            page_num = item["page_num"]
+            if isinstance(page_num, int):
+                item["page_num"] += page_offset + 1
+            if "children" in item:
+                update_page_offset(item["children"], page_offset)
+
+    update_page_offset(toc_tree1, page_offset)
     end_time = time.perf_counter()
     time_cost = end_time - start_time
     logger.debug(f"process {Path(input).stem} cost: {time_cost:.2f} seconds")
-    return pdf_bookmarks_path, time_cost
+    return pdf_bookmarks_path, time_cost, toc_tree1

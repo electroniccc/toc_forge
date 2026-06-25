@@ -39,6 +39,7 @@ def _parse_toc_lines(
         for cb in tp["content_boxes"]:
             cb_inner = cb.get("content_box", cb)
             cb_right = cb_inner["coordinate"][2]
+            cb_label = cb_inner.get("label", "content")
             for text, box in zip(cb["rec_texts"], cb["rec_boxes"]):
                 t = str(text).strip()
                 if not t:
@@ -56,6 +57,7 @@ def _parse_toc_lines(
                         "height": float(y2 - y1),
                         "x_center": float(x1 + x2) / 2.0,
                         "cb_right": float(cb_right),
+                        "cb_label": cb_label,
                     }
                 )
         if page_idx < len(page_heights):
@@ -183,6 +185,7 @@ def _parse_toc_lines(
         title = " ".join(b["text"] for b in title_items).strip()
         title = re.sub(r"\s+", " ", title)
         title = re.sub(r"[．….]+$", "", title)
+        title = re.sub(r"^[\*•·]\s*", "", title)
 
         # Extract parenthesized page number from title tail: "概述 …( 1 )" -> page 1
         if page_num is None:
@@ -205,6 +208,7 @@ def _parse_toc_lines(
             min(b["xmin"] for b in title_items) if title_items else line[0]["xmin"]
         )
         avg_ymin = sum(b["ymin"] for b in line) / len(line)
+        cb_label = line[0].get("cb_label", "content")
 
         parsed.append(
             {
@@ -212,6 +216,7 @@ def _parse_toc_lines(
                 "page_num": page_num,
                 "min_xmin": min_xmin,
                 "avg_ymin": avg_ymin,
+                "cb_label": cb_label,
             }
         )
 
@@ -223,18 +228,23 @@ def _parse_toc_lines(
 
 
 def _build_tree(parsed: list[dict]) -> list[dict]:
-    """Step 6: build hierarchical tree from parsed entries with .level set."""
+    """Step 6: build hierarchical tree from parsed entries with .level set.
+
+    Each entry is attached as a child of the most recent entry with a
+    *strictly smaller* level.  Entries at the same level are siblings,
+    not nested.
+    """
     root = []
-    stack = []
+    stack: list[dict] = []  # each item: {"node": ..., "level": ...}
     for p in parsed:
         node = {"title": p["title"], "page_num": p["page_num"], "children": []}
-        while len(stack) > p["level"]:
+        while stack and stack[-1]["level"] >= p["level"]:
             stack.pop()
         if not stack:
             root.append(node)
         else:
-            stack[-1]["children"].append(node)
-        stack.append(node)
+            stack[-1]["node"]["children"].append(node)
+        stack.append({"node": node, "level": p["level"]})
     return root
 
 
@@ -248,7 +258,7 @@ def _merge_page_trees(
     seen in the merged output so far.  Exercises / summaries are placed
     under the matching parent section when one can be identified.
     """
-    ch_pat = re.compile(r"^第[一二三四五六七八九十\d]+章(?!习题)")
+    ch_pat = re.compile(r"^第[一二三四五六七八九十\d]+(?:章(?!习题)|篇)")
     sec_pat = re.compile(r"^第[一二三四五六七八九十\d]+节")
     back_pat = re.compile(r"^附录|^参考书目|^参考文献|^名词索引|^索引|^学时分配")
 
@@ -258,15 +268,10 @@ def _merge_page_trees(
     _sec_num_pat = re.compile(r"^第([一二三四五六七八九十\d]+)节")
 
     def _is_chapter_like(node: dict) -> bool:
-        """Entry that looks like a top-level chapter (English or Chinese)."""
+        """Entry that looks like a top-level chapter."""
         return (
             ch_pat.match(node["title"]) is not None
             or back_pat.match(node["title"]) is not None
-            or (
-                # English: "1. Title", "2. Title" with single number — likely chapter
-                re.match(r"^\d+\.\s", node["title"])
-                and not re.match(r"^\d+\.\d+", node["title"])
-            )
         )
 
     def _find_section_child(children: list[dict], sec_num: int) -> dict | None:
@@ -295,13 +300,16 @@ def _merge_page_trees(
     merged = []
     for page_tree in per_page_trees:
         for node in page_tree:
-            # section-like = NOT a chapter/back-matter but looks like a subsection
+            # section-like = NOT a chapter/back-matter but looks like it belongs
+            # under a chapter (sections, exercises, summaries, numbered entries)
             sec_pattern = (
                 sec_pat.match(node["title"])
                 or re.match(r"^\d+\.\d+", node["title"])
                 or re.match(r"^本章小结|^练习|^总习题|^思考题", node["title"])
                 or re.match(r"^第[一二三四五六七八九十\d]+章习题", node["title"])
                 or re.match(r"^[一二三四五六七八九十]、|^习题\s*\d+", node["title"])
+                or re.match(r"^\d+\s*\S", node["title"])      # "1 Title"
+                or re.match(r"^小结$|^习题$", node["title"])   # standalone
             )
             is_section_like = not _is_chapter_like(node) and sec_pattern
 
@@ -358,7 +366,7 @@ def reconstruct_toc(
         return []
 
     # ---- Step 5: semantic patterns + xmin proximity fallback ----
-    ch_pat = re.compile(r"^第[一二三四五六七八九十\d]+章(?!习题)")
+    ch_pat = re.compile(r"^第[一二三四五六七八九十\d]+(?:章(?!习题)|篇)")
     sec_pat = re.compile(r"^第[一二三四五六七八九十\d]+节")
     sub_pat = re.compile(r"^[一二三四五六七八九十]、")
     exercise_sec_pat = re.compile(r"^习题\s*\d+")
@@ -503,17 +511,36 @@ def reconstruct_toc1(
     if not toc_results:
         return []
 
-    # ---- patterns for semantic corrections only ----
-    ch_pat = re.compile(r"^第[一二三四五六七八九十\d]+章(?!习题)")
+    # ---- patterns for semantic corrections (non-paragraph_title entries) ----
+    ch_pat = re.compile(r"^第[一二三四五六七八九十\d]+(?:章(?!习题)|篇)")
     back_pat = re.compile(r"^附录|^参考书目|^参考文献|^名词索引|^索引|^学时分配")
 
-    def _assign_levels(plist: list[dict]) -> None:
-        """Assign indentation levels via gap-tree clustering on x-coordinates.
+    # Semantic floor patterns: gap-tree decides the primary level, but these
+    # patterns set a *minimum* level so that e.g. a section header that is
+    # left-aligned with the chapter is not flattened into level 0.
+    _sec_floor_pat = re.compile(
+        r"^第[一二三四五六七八九十\d]+节"       # 第一节
+        r"|^\*?\d+\.(?!\d)"                     # 1. / *1. (not 1.1)
+        r"|^\d+\s*\S"                           # "1 Title" (numbered section)
+        r"|^习题\s*\d+"                          # 习题1-5
+        r"|^本章小结|^练习|^总习题|^思考题"
+        r"|^小结$|^习题$"                        # standalone
+        r"|^第[一二三四五六七八九十\d]+章习题"   # 第一章习题
+    )
+    _sub_floor_pat = re.compile(
+        r"^[一二三四五六七八九十]、"             # 一、二、三、
+        r"|^\d+\.\d+"                            # 1.1  1.2
+    )
 
-        The gap between sorted x-coordinates determines level boundaries.
-        Semantic patterns only override obviously wrong assignments (e.g. a
-        chapter title that was centred or an entry on the far right that
-        should not be a top-level chapter).
+    def _assign_levels(plist: list[dict]) -> None:
+        """Assign indentation levels via gap-tree + paragraph_title depth.
+
+        Paragraph_title entries above a content box form a nesting chain:
+        the first is level 0, the second level 1, etc.  Content entries
+        are shifted by the number of consecutive paragraph_titles above them.
+        Gap-tree clustering on x-coordinates then adds further indentation
+        within the content group.  Semantic floors only correct non-pt entries
+        that would otherwise collapse to the wrong level.
         """
         n = len(plist)
         if n < 2:
@@ -525,40 +552,56 @@ def reconstruct_toc1(
         sorted_x = np.sort(all_xmins)
         diffs = np.diff(sorted_x)
 
+        # ---- gap-tree: baseline levels from x-coordinates ----
         if len(diffs) == 0:
             for p in plist:
                 p["level"] = 0
-            return
+        else:
+            p50 = float(np.percentile(diffs, 50))
+            p90 = float(np.percentile(diffs, 90))
+            gap_threshold = p50 + (p90 - p50) * 2.0
+            min_gap = max(gap_threshold, 15.0)
 
-        p50 = float(np.percentile(diffs, 50))
-        p90 = float(np.percentile(diffs, 90))
-        gap_threshold = p50 + (p90 - p50) * 2.0
-        min_gap = max(gap_threshold, 15.0)
+            boundaries = [float(sorted_x[0])]
+            for i, d in enumerate(diffs):
+                if d > min_gap:
+                    boundaries.append(float(sorted_x[i + 1]))
+            boundaries.sort()
 
-        # ---- gap-tree: find level boundaries from significant gaps ----
-        boundaries = [float(sorted_x[0])]
-        for i, d in enumerate(diffs):
-            if d > min_gap:
-                boundaries.append(float(sorted_x[i + 1]))
-        boundaries.sort()
+            for p in plist:
+                x = p["min_xmin"]
+                dists = [abs(x - b) for b in boundaries]
+                p["level"] = int(np.argmin(dists))
 
+        # ---- paragraph_title depth (geometry-driven, language-agnostic) ----
+        pt_depth = 0
+        prev_was_pt = False
+        for p in plist:  # already sorted by avg_ymin in caller
+            is_pt = p.get("cb_label") == "paragraph_title"
+            if is_pt:
+                if not prev_was_pt:
+                    pt_depth = 0
+                p["level"] = pt_depth
+                pt_depth += 1
+            else:
+                p["level"] = pt_depth + p["level"]
+            prev_was_pt = is_pt
+
+        # ---- semantic corrections (non-pt entries only) ----
         for p in plist:
-            x = p["min_xmin"]
-            dists = [abs(x - b) for b in boundaries]
-            p["level"] = int(np.argmin(dists))
-
-        # ---- semantic corrections ----
-        # Force chapter / back-matter to level 0; push orphaned far-right
-        # entries up one level so they don't masquerade as chapters.
-        for p in plist:
-            if ch_pat.match(p["title"]):
+            if p.get("cb_label") == "paragraph_title":
+                continue
+            t = p["title"]
+            if ch_pat.match(t):
                 p["level"] = 0
-            elif re.match(r"^\d+\.\s", p["title"]) and not re.match(
-                r"^\d+\.\d+", p["title"]
-            ):
+            elif back_pat.match(t):
                 p["level"] = 0
-            elif back_pat.match(p["title"]):
-                p["level"] = 0
+            # Section-like: at least level 1
+            elif _sec_floor_pat.match(t) and p["level"] < 1:
+                p["level"] = 1
+            # Subsection-like: at least level 2
+            elif _sub_floor_pat.match(t) and p["level"] < 2:
+                p["level"] = 2
 
         # If every entry landed in the same bin but x-std is large,
         # force a 2-cluster split (KMeans).
@@ -569,14 +612,19 @@ def reconstruct_toc1(
                 km = KMeans(n_clusters=2, random_state=42, n_init=10).fit(x_arr)
                 right_label = int(np.argmax(km.cluster_centers_))
                 for p, lb in zip(plist, km.labels_):
+                    t = p["title"]
+                    if p.get("cb_label") == "paragraph_title":
+                        continue
                     # never override a chapter / back-matter assignment
-                    if ch_pat.match(p["title"]) or back_pat.match(p["title"]):
+                    if ch_pat.match(t) or back_pat.match(t):
                         continue
-                    if re.match(r"^\d+\.\s", p["title"]) and not re.match(
-                        r"^\d+\.\d+", p["title"]
-                    ):
-                        continue
-                    p["level"] = 1 if int(lb) == right_label else 0
+                    new_level = 1 if int(lb) == right_label else 0
+                    # respect semantic floors
+                    if _sub_floor_pat.match(t):
+                        new_level = max(new_level, 2)
+                    elif _sec_floor_pat.match(t):
+                        new_level = max(new_level, 1)
+                    p["level"] = new_level
 
     per_page_trees = []
 
@@ -610,13 +658,17 @@ def reconstruct_toc1(
 def repair_toc_tree(tree: list[dict]) -> list[dict]:
     """Post-process: fix misplaced entries based on semantic rules.
 
-    Two passes:
+    Three passes:
+      0. Root-level: re-parent ``第X章`` entries under their preceding
+         ``第X篇`` when both exist at the root.
       1. Root-level: re-parent orphan section-like entries under their last chapter.
-      2. Chapter children: re-parent exercises / summaries under their matching
+      2. Chapter children: re-parent exercises under their matching
          parent section (e.g. ``习题1-5`` → ``第五节``).
     """
     sec_like = re.compile(r"^\*?\d+\.\d+")
-    ch_like = re.compile(r"^第[一二三四五六七八九十\d]+章")
+    pian_like = re.compile(r"^第[一二三四五六七八九十\d]+篇")
+    zhang_like = re.compile(r"^第[一二三四五六七八九十\d]+章(?!习题)")
+    ch_like = re.compile(r"^第[一二三四五六七八九十\d]+[章篇]")
     _cn_num = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
                "八": 8, "九": 9, "十": 10}
     _sec_num_pat = re.compile(r"^第([一二三四五六七八九十\d]+)节")
@@ -624,6 +676,64 @@ def repair_toc_tree(tree: list[dict]) -> list[dict]:
 
     def _is_chapter(node: dict) -> bool:
         return bool(ch_like.match(node["title"]))
+
+    def _fix_pian_structure(nodes: list[dict]) -> list[dict]:
+        """Nest ``第X章`` entries under their preceding ``第X篇``.
+
+        When a tree has both 篇 and 章 at the root level, all chapters
+        between two 篇 are collected as children of the first 篇.
+        """
+        result: list[dict] = []
+        current_pian = None
+        for node in nodes:
+            if pian_like.match(node["title"]):
+                current_pian = node
+                result.append(node)
+            elif zhang_like.match(node["title"]) and current_pian is not None:
+                current_pian.setdefault("children", []).append(node)
+            else:
+                result.append(node)
+        return result
+
+    _zhang_num_pat = re.compile(r"^第([一二三四五六七八九十\d]+)章")
+    _sec_prefix_pat = re.compile(r"^(\d+)\.")
+
+    def _fix_zhang_sections(nodes: list[dict]) -> list[dict]:
+        """Re-parent orphan numbered sections under their matching chapter.
+
+        e.g. ``7.1``, ``7.2``, ``7.3`` → ``第7章`` when both are at the
+        same level.
+        """
+        chapters: dict[int, dict] = {}
+        for node in nodes:
+            m = _zhang_num_pat.match(node["title"])
+            if m:
+                cn = m.group(1)
+                n = int(cn) if cn.isdigit() else _cn_num.get(cn, 0)
+                if n > 0:
+                    chapters[n] = node
+
+        if not chapters:
+            return nodes
+
+        result: list[dict] = []
+        for node in nodes:
+            zm = _zhang_num_pat.match(node["title"])
+            if zm:
+                result.append(node)
+                continue
+            sm = _sec_prefix_pat.match(node["title"])
+            if sm:
+                ch_num = int(sm.group(1))
+                if ch_num in chapters:
+                    chapters[ch_num].setdefault("children", []).append(node)
+                    continue
+            result.append(node)
+
+        for ch in chapters.values():
+            if ch.get("children"):
+                ch["children"].sort(key=lambda c: _section_sort_key(c["title"]))
+        return result
 
     def _sec_ordinal(title: str) -> int | None:
         """Return the ordinal number of a section title, e.g. ``第五节`` → 5."""
@@ -673,7 +783,13 @@ def repair_toc_tree(tree: list[dict]) -> list[dict]:
         result.extend(sorted(keep, key=lambda c: _section_sort_key(c["title"])))
         return result
 
-    # ---- Pass 1: root-level fixup ----
+    # ---- Pass 0: nest 章 under 篇 ----
+    tree = _fix_pian_structure(tree)
+
+    # ---- Pass 1: nest sections under their matching 章 ----
+    tree = _fix_zhang_sections(tree)
+
+    # ---- Pass 2: root-level fixup ----
     fixed_root = []
     last_chapter = None
     for node in tree:
@@ -685,7 +801,7 @@ def repair_toc_tree(tree: list[dict]) -> list[dict]:
             last_chapter = node
         fixed_root.append(node)
 
-    # ---- Pass 2: re-parent exercises under their sections ----
+    # ---- Pass 3: re-parent exercises under their sections ----
     for node in fixed_root:
         if node.get("children"):
             if _is_chapter(node) or ch_like.match(node["title"]):
@@ -693,3 +809,45 @@ def repair_toc_tree(tree: list[dict]) -> list[dict]:
             node["children"].sort(key=lambda c: _section_sort_key(c["title"]))
 
     return fixed_root
+
+
+def inherit_page_numbers(
+    tree: list[dict], max_depth: int = 3
+) -> list[dict]:
+    """Fill missing page numbers from descendants or next sibling.
+
+    Nodes with ``page_num is None`` (common for entries from
+    ``paragraph_title`` boxes that don't include the page-number area)
+    inherit the first non-None page number found in:
+      1. children / grandchildren (up to *max_depth*)
+      2. the next sibling at the same level
+    """
+
+    def _first_child_page(node: dict, depth: int) -> int | None:
+        if depth <= 0:
+            return None
+        for child in node.get("children", []):
+            if isinstance(child.get("page_num"), int):
+                return child["page_num"]
+            result = _first_child_page(child, depth - 1)
+            if result is not None:
+                return result
+        return None
+
+    def _fix_node(node: dict, siblings: list[dict], idx: int) -> None:
+        pn = node.get("page_num")
+        if pn is None or not isinstance(pn, int):
+            inherited = _first_child_page(node, max_depth)
+            if inherited is None and siblings:
+                for sib in siblings[idx + 1 :]:
+                    if isinstance(sib.get("page_num"), int):
+                        inherited = sib["page_num"]
+                        break
+            if inherited is not None:
+                node["page_num"] = inherited
+        for i, child in enumerate(node.get("children", [])):
+            _fix_node(child, node["children"], i)
+
+    for i, node in enumerate(tree):
+        _fix_node(node, tree, i)
+    return tree
