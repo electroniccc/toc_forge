@@ -2,6 +2,7 @@
 
 import logging
 import re
+from collections import defaultdict
 
 import numpy as np
 from sklearn.cluster import KMeans
@@ -36,7 +37,7 @@ def _parse_toc_lines(
     for pi, tp in enumerate(toc_results):
         y_offset = cumulative_y
         page_idx = tp.get("page", pi)
-        for cb in tp["content_boxes"]:
+        for cbi, cb in enumerate(tp["content_boxes"]):
             cb_inner = cb.get("content_box", cb)
             cb_right = cb_inner["coordinate"][2]
             cb_label = cb_inner.get("label", "content")
@@ -58,6 +59,8 @@ def _parse_toc_lines(
                         "x_center": float(x1 + x2) / 2.0,
                         "cb_right": float(cb_right),
                         "cb_label": cb_label,
+                        "page_idx": page_idx,
+                        "cb_idx": cbi,
                     }
                 )
         if page_idx < len(page_heights):
@@ -68,27 +71,37 @@ def _parse_toc_lines(
     if not all_items:
         return [], page_heights
 
-    # ---- Step 3: group items into lines by y-overlap ----
-    all_items.sort(key=lambda b: b["ymin"])
-    lines = []
+    # ---- Step 3: group items into lines by y-overlap (within each content box) ----
+    # Partition items by (page_idx, cb_idx) to avoid cross-column contamination
+    cb_buckets: dict[tuple[int, int], list[dict]] = defaultdict(list)
     for item in all_items:
-        placed = False
-        for line in lines:
-            line_ymin = sum(b["ymin"] for b in line) / len(line)
-            line_ymax = sum(b["ymax"] for b in line) / len(line)
-            line_h = line_ymax - line_ymin
-            overlap_ymin = max(item["ymin"], line_ymin)
-            overlap_ymax = min(item["ymax"], line_ymax)
-            if overlap_ymax > overlap_ymin:
-                overlap_h = overlap_ymax - overlap_ymin
-                if overlap_h / max(item["height"], 1) > 0.3 or (
-                    line_h > 0 and overlap_h / line_h > 0.3
-                ):
-                    line.append(item)
-                    placed = True
-                    break
-        if not placed:
-            lines.append([item])
+        cb_buckets[(item["page_idx"], item["cb_idx"])].append(item)
+
+    lines = []
+    for bucket_items in cb_buckets.values():
+        bucket_items.sort(key=lambda b: b["ymin"])
+        for item in bucket_items:
+            placed = False
+            for line in lines:
+                # Only consider lines from the same content box
+                if line[0]["page_idx"] != item["page_idx"] or line[0]["cb_idx"] != item["cb_idx"]:
+                    continue
+                # Check y-overlap against the line's average y-range
+                line_ymin = sum(b["ymin"] for b in line) / len(line)
+                line_ymax = sum(b["ymax"] for b in line) / len(line)
+                line_h = line_ymax - line_ymin
+                overlap_ymin = max(item["ymin"], line_ymin)
+                overlap_ymax = min(item["ymax"], line_ymax)
+                if overlap_ymax > overlap_ymin:
+                    overlap_h = overlap_ymax - overlap_ymin
+                    if overlap_h / max(item["height"], 1) > 0.3 or (
+                        line_h > 0 and overlap_h / line_h > 0.3
+                    ):
+                        line.append(item)
+                        placed = True
+                        break
+            if not placed:
+                lines.append([item])
 
     # ---- Step 4: parse each line -> (title, page_num, min_xmin, avg_ymin) ----
     ignore_titles = {
@@ -122,9 +135,11 @@ def _parse_toc_lines(
 
         roman_pat = re.compile(r"^[IVXLCDMivxlcdm]+$")
         digit_pat = re.compile(r"^\d+$")
-        trailed_pat = re.compile(r"^[\.…·]{1,3}\s*\d+$")
+        # dot chars: ASCII dot, fullwidth dot (U+FF0E), ellipsis, middle dot
+        _DOT_CHARS = ".．…·"
+        trailed_pat = re.compile(rf"^[{_DOT_CHARS}]{{1,3}}\s*\d+$")
         # dot-leader + trailing digit merged in one fragment: "…………6"
-        dot_leader_num_pat = re.compile(r"[\.…·]{2,}\s*(\d+)$")
+        dot_leader_num_pat = re.compile(rf"[{_DOT_CHARS}]{{2,}}\s*(\d+)$")
 
         for i in range(len(line) - 1, -1, -1):
             item = line[i]
@@ -163,11 +178,12 @@ def _parse_toc_lines(
                     continue
             if is_trailed:
                 page_num = int(re.search(r"\d+$", t).group(0))
+                title_end = i
             elif is_paren:
                 page_num = int(re.search(r"\d+", t).group(0))
+                title_end = i
             elif is_dot_leader:
                 page_num = int(dot_m.group(1))
-                # remove the dot-leader + page number tail from this fragment
                 trimmed = dot_leader_num_pat.sub("", t).strip()
                 if trimmed:
                     line[i]["text"] = trimmed
@@ -176,9 +192,10 @@ def _parse_toc_lines(
                     title_end = i
             elif t.isdigit():
                 page_num = int(t)
+                title_end = i
             else:
                 page_num = t.upper()
-            title_end = i
+                title_end = i
             break
 
         title_items = line[:title_end]
@@ -186,7 +203,6 @@ def _parse_toc_lines(
         title = re.sub(r"\s+", " ", title)
         title = re.sub(r"[．….]+$", "", title)
         title = re.sub(r"^[\*•·]\s*", "", title)
-
         # Extract parenthesized page number from title tail: "概述 …( 1 )" -> page 1
         if page_num is None:
             m = re.search(r"[\(（]\s*(\d+)\s*[\)）]\s*$", title)
@@ -197,13 +213,15 @@ def _parse_toc_lines(
         # Fallback: trailing dot-leader + digits glued to title tail
         # e.g. "1.1 关于机器学习……2" -> title "1.1 关于机器学习", page 2
         if page_num is None:
-            m = re.search(r"[\.…·]{1,}\s*(\d+)\s*$", title)
+            m = re.search(rf"[{_DOT_CHARS}]{{1,}}\s*(\d+)\s*$", title)
             if m:
                 page_num = int(m.group(1))
-                title = re.sub(r"[\.…·]{1,}\s*\d+\s*$", "", title)
+                title = re.sub(rf"[{_DOT_CHARS}]{{1,}}\s*\d+\s*$", "", title)
 
         # Re-strip trailing dot leaders exposed after parenthesized-number removal
         title = re.sub(r"[．….·\s]+$", "", title)
+        # Strip trailing colon / semicolon (OCR artifacts from stray fragments)
+        title = re.sub(r"\s*[:：;；]\s*$", "", title)
 
         if not title:
             continue
@@ -213,7 +231,7 @@ def _parse_toc_lines(
         if re.search(r"[IVXLCDMivxlcdm]+\s*[|｜]?\s*(?:目录|目次)", title):
             continue
 
-        clean = re.sub(r"[\s\.·…\-]+", "", title)
+        clean = re.sub(rf"[\s{re.escape(_DOT_CHARS)}\-]+", "", title)
         if clean in ignore_titles:
             continue
 
@@ -562,23 +580,24 @@ def reconstruct_toc1(
             return
 
         all_xmins = np.array([p["min_xmin"] for p in plist], dtype=np.float64)
-        sorted_x = np.sort(all_xmins)
-        diffs = np.diff(sorted_x)
+        # Deduplicate x-coordinates so repeated positions don't inflate the
+        # gap statistics with zeros.  The structural gaps between distinct
+        # indentation levels are what matter.
+        unique_x = np.unique(all_xmins)
+        diffs = np.diff(unique_x)
 
         # ---- gap-tree: baseline levels from x-coordinates ----
         if len(diffs) == 0:
             for p in plist:
                 p["level"] = 0
         else:
-            p50 = float(np.percentile(diffs, 50))
-            p90 = float(np.percentile(diffs, 90))
-            gap_threshold = p50 + (p90 - p50) * 2.0
-            min_gap = max(gap_threshold, 15.0)
+            p80 = float(np.percentile(diffs, 80))
+            min_gap = max(p80, 8.0)
 
-            boundaries = [float(sorted_x[0])]
+            boundaries = [float(unique_x[0])]
             for i, d in enumerate(diffs):
-                if d > min_gap:
-                    boundaries.append(float(sorted_x[i + 1]))
+                if d >= min_gap:
+                    boundaries.append(float(unique_x[i + 1]))
             boundaries.sort()
 
             for p in plist:
@@ -638,7 +657,6 @@ def reconstruct_toc1(
                     elif _sec_floor_pat.match(t):
                         new_level = max(new_level, 1)
                     p["level"] = new_level
-
     per_page_trees = []
 
     for tp in toc_results:

@@ -207,7 +207,7 @@ def _section_sort_key(title: str) -> tuple:
         return (ch_num, 9000)
     m = re.search(r"(\d+(?:\.\d+)*)", title)
     if not m:
-        return (9999, title)
+        return (9999,)
     parts = m.group(1).split(".")
     return tuple(int(x) for x in parts)
 

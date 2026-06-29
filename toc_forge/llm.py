@@ -7,26 +7,32 @@ import os
 import re
 
 import cv2
+import httpx
 from openai import OpenAI
 
 from .ocr_engine import ocr_toc_pages
-from .utils import NumpyEncoder
 
 logger = logging.getLogger(__name__)
 
 _TOC_LLM_SYSTEM_PROMPT = (
-    "You are a table-of-contents parser. The input is a JSON array of OCR results "
-    'from a book\'s TOC pages. Each element has: "page" (PDF page index), '
-    '"content_boxes" (array of detected TOC regions). Each content_box has: '
-    '"rec_texts" (OCR text fragments on that line), "rec_boxes" (bounding box '
-    '[x1,y1,x2,y2] for each fragment), "content_box" with a "coordinate" '
-    "[x1,y1,x2,y2] of the containing region.\n\n"
+    "You are a table-of-contents parser for a Chinese academic textbook. "
+    "The input is a JSON array where each element has:\n"
+    '- "page": PDF page index (0-based)\n'
+    '- "lines": array of text strings from that TOC page, in reading order. '
+    "Each line is a TOC entry (title) optionally followed by its page number.\n\n"
+    "How to determine hierarchy from text patterns:\n"
+    '- Top level (chapters/parts): "第X章", "第X篇", or standalone "Chapter X"\n'
+    '- Second level (sections): "第一节/第二节/…", "X.Y" numbered sections\n'
+    '- Third level (subsections): "一、", "二、", "（一）", "1.", "1）"\n'
+    '- Exercises: "习题X-Y" nest under their matching section; "总习题X" under the chapter\n'
+    "- Entries with deeper numbering (e.g. 1.1.1) nest under their prefix (1.1)\n\n"
     "Rules:\n"
-    '- Each output node: "title" (str), "page_num" (int or null), "children" (list of nodes).\n'
-    "- Use rec_boxes x1 for indentation: smaller x1 = higher level, larger x1 = deeper nesting.\n"
-    "- Fragments at the far right (large x1, near the content_box right edge) are page numbers.\n"
-    "- Consecutive fragments with similar x1 that belong to the same title should be joined.\n"
-    "- Drop trailing dot-leaders from titles.\n"
+    '- Each output node: "title" (str), "page_num" (int or null), "children" (list of nodes)\n'
+    "- The last number on a line is the page number; remove it from the title\n"
+    "- Drop trailing dot-leaders (…, ...) from titles\n"
+    "- Join fragmented titles that clearly belong together (e.g. a chapter title split across lines)\n"
+    '- Preserve the full title text including chapter/section numbers ("第1章", "1.1")\n'
+    "- If a page number is missing on a heading, inherit from its first child\n"
     '- Output a JSON object: {"toc": [...]}  -- no markdown fences, no extra text.'
 )
 
@@ -56,6 +62,7 @@ def _build_llm_client(
     return OpenAI(
         api_key=api_key or os.environ.get("OPENAI_API_KEY", "sk-placeholder"),
         base_url=base_url or os.environ.get("OPENAI_BASE_URL"),
+        timeout=httpx.Timeout(300.0, read=300.0, write=60.0, connect=30.0),
     )
 
 
@@ -87,6 +94,49 @@ def _call_llm(
         raise
 
 
+def _simplify_ocr_for_llm(toc_results: list[dict]) -> list[dict]:
+    """Strip bounding boxes from OCR results, keeping only text lines per page."""
+    simplified = []
+    for tp in toc_results:
+        page_idx = tp.get("page", 0)
+        page_lines = []
+        for cb in tp["content_boxes"]:
+            # Collect text fragments with their y-ranges for this content box only
+            items = []
+            for text, box in zip(cb["rec_texts"], cb["rec_boxes"]):
+                t = str(text).strip()
+                if not t:
+                    continue
+                items.append({"text": t, "ymin": box[1], "ymax": box[3]})
+
+            if not items:
+                continue
+
+            # Group into lines by y-overlap (within this content box)
+            items.sort(key=lambda x: x["ymin"])
+            line_groups = []
+            for item in items:
+                placed = False
+                for group in line_groups:
+                    g_ymin = sum(g["ymin"] for g in group) / len(group)
+                    g_ymax = sum(g["ymax"] for g in group) / len(group)
+                    if max(item["ymin"], g_ymin) < min(item["ymax"], g_ymax):
+                        group.append(item)
+                        placed = True
+                        break
+                if not placed:
+                    line_groups.append([item])
+
+            for group in line_groups:
+                group.sort(key=lambda x: x["ymin"])
+                line_text = " ".join(g["text"] for g in group)
+                page_lines.append(line_text)
+
+        simplified.append({"page": page_idx, "lines": page_lines})
+
+    return simplified
+
+
 def build_toc_llm(
     toc_pages: list[dict],
     page_imgs,
@@ -110,7 +160,14 @@ def build_toc_llm(
         pdf_hash=pdf_hash,
     )
 
-    ocr_json = json.dumps(toc_results, ensure_ascii=False, cls=NumpyEncoder)
+    simplified = _simplify_ocr_for_llm(toc_results)
+    ocr_json = json.dumps(simplified, ensure_ascii=False)
+    logger.info(
+        "LLM input: %d pages, %d lines, %d chars",
+        len(simplified),
+        sum(len(p["lines"]) for p in simplified),
+        len(ocr_json),
+    )
     if do_debug:
         debug_path = os.path.join(output, "toc_llm_input.json")
         with open(debug_path, "w", encoding="utf-8") as f:
