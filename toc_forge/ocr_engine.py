@@ -159,8 +159,9 @@ def ocr_number_pages(
     pdf_hash: str | None = None,
 ) -> list[dict]:
     last_toc_page_idx = toc_pages[-1]["page"]
-    page_sample_count = 5
     number_page_results = []
+    sample_idxs = []
+    page_sample_count = 3
     for number_page in number_pages:
         if page_sample_count == 0:
             break
@@ -168,8 +169,19 @@ def ocr_number_pages(
         if page_idx <= last_toc_page_idx:
             continue
         page_sample_count -= 1
+        sample_idxs.append(page_idx)
+    for i in range(len(number_pages)-3, len(number_pages)):
+        if i < 0:
+            continue
+        number_page = number_pages[i]
+        page_idx = number_page["page"]
+        if page_idx <= last_toc_page_idx:
+            continue
+        if page_idx in sample_idxs:
+            continue
+        sample_idxs.append(page_idx)
+    for page_idx in sample_idxs:
         img = page_imgs[page_idx]
-
         img_h_original = img.shape[0]
         img_y_offset = 0
         if half_img:

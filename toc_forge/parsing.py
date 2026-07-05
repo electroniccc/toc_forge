@@ -347,12 +347,29 @@ def _merge_page_trees(
             if is_section_like and merged:
                 last = merged[-1]
                 if _is_chapter_like(last):
-                    parent = _parent_section(node, last.get("children", []))
+                    children = last.get("children", [])
+                    parent = _parent_section(node, children)
+                    # If no exercise parent matched and this entry is a
+                    # sub-item (not a new section/summary header), attach
+                    # it to the last section under the chapter so that
+                    # orphan sub-items from continuation pages land correctly.
+                    _is_new_section = sec_pat.match(node.get("title", ""))
+                    _is_summary = re.match(
+                        r"^本章小结|^练习|^总习题|^思考题",
+                        node.get("title", ""),
+                    )
+                    if parent is None and children and not _is_new_section and not _is_summary:
+                        last_child = children[-1]
+                        if sec_pat.match(last_child.get("title", "")):
+                            parent = last_child
                     target = parent if parent is not None else last
                     target["children"].append(node)
                     if target["children"]:
                         target["children"].sort(
-                            key=lambda c: _section_sort_key(c["title"])
+                            key=lambda c: (
+                                c.get("page_num") or 99999,
+                                _section_sort_key(c["title"]),
+                            )
                         )
                     continue
             merged.append(node)
@@ -763,7 +780,12 @@ def repair_toc_tree(tree: list[dict]) -> list[dict]:
 
         for ch in chapters.values():
             if ch.get("children"):
-                ch["children"].sort(key=lambda c: _section_sort_key(c["title"]))
+                ch["children"].sort(
+                    key=lambda c: (
+                        c.get("page_num") or 99999,
+                        _section_sort_key(c["title"]),
+                    )
+                )
         return result
 
     def _sec_ordinal(title: str) -> int | None:
@@ -808,10 +830,23 @@ def repair_toc_tree(tree: list[dict]) -> list[dict]:
 
         for sec in sections:
             if sec.get("children"):
-                sec["children"].sort(key=lambda c: _section_sort_key(c["title"]))
+                sec["children"].sort(
+                    key=lambda c: (
+                        c.get("page_num") or 99999,
+                        _section_sort_key(c["title"]),
+                    )
+                )
 
-        result = sorted(sections, key=lambda c: _section_sort_key(c["title"]))
-        result.extend(sorted(keep, key=lambda c: _section_sort_key(c["title"])))
+        result = sorted(
+            sections,
+            key=lambda c: (c.get("page_num") or 99999, _section_sort_key(c["title"])),
+        )
+        result.extend(
+            sorted(
+                keep,
+                key=lambda c: (c.get("page_num") or 99999, _section_sort_key(c["title"])),
+            )
+        )
         return result
 
     # ---- Pass 0: nest 章 under 篇 ----
@@ -837,7 +872,12 @@ def repair_toc_tree(tree: list[dict]) -> list[dict]:
         if node.get("children"):
             if _is_chapter(node) or ch_like.match(node["title"]):
                 node["children"] = _fix_chapter_children(node["children"])
-            node["children"].sort(key=lambda c: _section_sort_key(c["title"]))
+            node["children"].sort(
+                key=lambda c: (
+                    c.get("page_num") or 99999,
+                    _section_sort_key(c["title"]),
+                )
+            )
 
     return fixed_root
 

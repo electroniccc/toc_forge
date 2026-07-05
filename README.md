@@ -22,12 +22,13 @@ uv pip install -r requirements.txt
 ```
 **Run CLI**
 ```Python
+uv pip install .
 # build TOC with PaddleOCR running on local machine
-python toc_forge.py --input <pdf_file> --output <output_folder>
+python -m toc_forge --input <pdf_file> --output <output_folder>
 # build TOC with local OCR + text LLM
-python toc_forge.py --input <pdf_file> --api_base_url --api_key <your api key> --llm_name deepseek-v4-flash
+python -m toc_forge --input <pdf_file> --api_base_url --api_key <your api key> --llm_name deepseek-v4-flash
 # build TOC with vision LLM
-python toc_forge.py --input <pdf_file> --api_base_url --api_key <your api key> --vllm_name qwen3.6-flash
+python -m toc_forge --input <pdf_file> --api_base_url --api_key <your api key> --vllm_name qwen3.6-flash
 ```
 **Run Web APP**
 ```python

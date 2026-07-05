@@ -28,21 +28,22 @@ source .venv/bin/activate        # Windows 用户请执行: .venv\Scripts\activa
 
 # 安装依赖
 uv pip install -r requirements.txt
+uv pip install .
 ```
 
 ## 基础使用
 ```bash
 # 1. 基础模式（仅本地 PaddleOCR，推荐新手使用）
-python toc_forge.py --input your_file.pdf --output ./output/
+python -m toc_forge --input your_file.pdf --output ./output/
 
 # 2. 使用文本 LLM 增强（目前推荐）
-python toc_forge.py --input your_file.pdf --output ./output/ \
+python -m toc_forge --input your_file.pdf --output ./output/ \
   --api_base_url https://api.deepseek.com \
   --api_key sk-xxxxxxxxxxxxxxxx \
   --llm_name deepseek-chat-v4
 
 # 3. 使用 Vision LLM（对复杂排版和扫描件效果更强）
-python toc_forge.py --input your_file.pdf --output ./output/ \
+python -m toc_forge --input your_file.pdf --output ./output/ \
   --api_base_url https://api.qwen.ai \
   --api_key sk-xxxxxxxxxxxxxxxx \
   --vllm_name qwen3.6-flash

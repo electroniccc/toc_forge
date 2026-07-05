@@ -13,7 +13,7 @@ from .llm import build_toc_llm, build_toc_vllm
 from .ocr_engine import get_toc_pages, ocr_number_pages
 from .parsing import inherit_page_numbers, reconstruct_toc1, repair_toc_tree
 from .utils import (
-    _roman_to_int,
+    # _roman_to_int,
     compute_file_hash,
     image_from_page,
     make_sure_model_exists,
@@ -81,7 +81,8 @@ def get_page_offset(number_page_results: list[dict]) -> int:
                 try:
                     page_num = int(raw)
                 except ValueError:
-                    page_num = _roman_to_int(raw)
+                    # page_num = _roman_to_int(raw)
+                    page_num = None
                 if page_num is None:
                     m = re.search(r"\d+", raw)
                     if m:
@@ -173,7 +174,7 @@ def bookmark_pdf(
     pdf_hash = compute_file_hash(input) if cache_dir else None
     doc = fitz.open(input)
     page_imgs = []
-    for i in range(min(30, doc.page_count)):
+    for i in range(min(50, doc.page_count)):
         page = doc[i]
         img = image_from_page(page)
         page_imgs.append(img)
@@ -196,6 +197,7 @@ def bookmark_pdf(
     if not toc_pages:
         print("未检测到目录页")
         return "", 0, {}
+    logger.debug(f"number_pages: {number_pages}")
 
     doc_ori_classify_model = "PP-LCNet_x1_0_doc_ori"
     make_sure_model_exists(model_dir, doc_ori_classify_model)

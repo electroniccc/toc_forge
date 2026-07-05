@@ -69,7 +69,7 @@ async def bookmark_pdf(
             file.filename, os.path.getsize(input_path), toc_strategy,
         )
         loop = asyncio.get_running_loop()
-        pdf_path, elapsed = await loop.run_in_executor(
+        pdf_path, elapsed, _ = await loop.run_in_executor(
             None, _run_bookmark, input_path, output_dir, toc_strategy, api_base_url, api_key,
         )
         logger.info("Done %s in %.1fs", file.filename, elapsed)
