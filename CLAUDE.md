@@ -43,6 +43,9 @@ python -m toc_forge --input <pdf_path> --output <output_dir> [--model_dir ./mode
 - `--api_key`: API key (also reads `OPENAI_API_KEY` env var)
 - `--llm_name`: text LLM model name for the `llm` strategy (e.g. `deepseek-v4-flash`)
 - `--vllm_name`: vision LLM model name for the `vllm` strategy (e.g. `qwen3.6-35b-a3b`)
+- `--no_toc_cache`: for `llm`/`vllm` strategies, re-call the LLM even if a cached TOC tree exists
+- `--device`: device for PaddleOCR inference — `cpu`, `gpu`, `gpu:0`, etc. (default: auto-detect)
+- `--llm_timeout`: LLM API request timeout in seconds (default: `600`). Increase if using slow reasoning models.
 
 Output: `{output}/{input_stem}_bookmarked.pdf` with injected PDF outline.
 
@@ -118,13 +121,19 @@ Models are downloaded from `paddle-model-ecology.bj.bcebos.com` if not found loc
 
 Layout, OCR, and structure results are cached per-PDF and per-page under `--cache_dir/{pdf_hash}/`. Cache keys are `{stage}_page_{idx}.json` (or `{stage}.json` for non-per-page results). Caching uses `_cache_load` / `_cache_save` with the `CachedResult` wrapper class that mimics PaddleX result objects. Legacy wrapped format `{"res": {...}}` is unwrapped via `_unwrap_legacy_cache`.
 
+The final TOC tree produced by the `llm`/`vllm` strategies is also cached as `toc_tree_llm.json` / `toc_tree_vllm.json` under the same directory, so repeat runs of the same document skip the LLM call (and the OCR it depends on). `--no_toc_cache` forces a fresh LLM call; the fresh result still refreshes the cache. Handled by `_load_toc_tree_cache` / `_save_toc_tree_cache` in `toc_forge/llm.py`.
+
 ### LLM integration
 
 LLM strategies use the `openai` SDK via `_build_llm_client()` and `_call_llm()`. Both system prompts are defined as module-level constants:
 - `_TOC_LLM_SYSTEM_PROMPT` — instructs the LLM to parse OCR JSON into a TOC tree
 - `_TOC_VLLM_SYSTEM_PROMPT` — instructs the vision LLM to parse page images directly
 
-`_call_llm` strips markdown fences from the response before JSON parsing, and logs response length + preview at INFO level.
+Both prompts are **language-agnostic** (not limited to Chinese academic textbooks): hierarchy is inferred from numbering depth (llm) or visual cues like font size, boldness, and indentation (vllm), with Chinese/English/roman-numeral patterns all treated as examples of the same structural rules. Front/back matter (Preface, Appendix, Bibliography, Index) is recognized as top-level entries.
+
+Both prompts explicitly forbid inline LaTeX (`$...$`) in titles — PDF bookmarks cannot render it.  The model is instructed to use Unicode for all mathematical notation: Greek letters and math symbols (`α`, `β`, `∫`, `∑`, `∇`, `∞`, `ℏ`), superscripts (`x²`, `zⁿ`), subscripts (`x₁`, `aₙ`), and simple expressions (`w=zⁿ`, `f(z)=u+iv`).  As a safety net, `_sanitize_math_in_title` / `_sanitize_toc_tree` post-process every returned TOC tree before caching — it converts any remaining `$...$` to their closest Unicode equivalents (LaTeX commands → Unicode glyphs, `^x` → superscript chars, `_x` → subscript chars, stripping `\mathrm{}` etc.).  The mapping tables cover all common Greek letters, math operators, and superscript/subscript digits and Latin letters.
+
+`_call_llm` always passes `extra_body={"enable_thinking": False}` — TOC extraction is a structured parsing task that does not benefit from reasoning mode, and disabling it avoids wasted latency.  It strips markdown fences from the response before JSON parsing, and logs response length + preview at INFO level.  `_build_llm_client` uses `httpx.Timeout` with the configured `llm_timeout` (default 600 s) for both connect and read phases, and sets `max_retries=0` — timeout retries are pointless.  Set `--llm_timeout` higher (e.g. `1200`) for exceptionally large documents.
 
 ### TOC tree data structure
 

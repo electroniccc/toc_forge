@@ -17,7 +17,7 @@ from .utils import (
     compute_file_hash,
     image_from_page,
     make_sure_model_exists,
-    print_toc_result,
+    # print_toc_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -169,6 +169,9 @@ def bookmark_pdf(
     api_key: str | None = None,
     llm_name: str = "deepseek-v4-flash",
     vllm_name: str = "qwen3.6-35b-a3b",
+    no_toc_cache: bool = False,
+    device: str | None = None,
+    llm_timeout: float = 600.0,
 ) -> tuple[str, float, dict]:
     start_time = time.perf_counter()
     pdf_hash = compute_file_hash(input) if cache_dir else None
@@ -185,6 +188,7 @@ def bookmark_pdf(
     layout_model = LayoutDetection(
         model_name=layout_detection_model,
         model_dir=os.path.join(model_dir, layout_detection_model),
+        device=device,
     )
     toc_pages, number_pages = get_toc_pages(
         page_imgs,
@@ -212,9 +216,13 @@ def bookmark_pdf(
             page_imgs,
             do_debug=do_debug,
             output=output,
+            cache_dir=cache_dir,
+            pdf_hash=pdf_hash,
+            no_toc_cache=no_toc_cache,
             llm_model=vllm_name,
             llm_api_key=api_key,
             llm_base_url=api_base_url,
+            llm_timeout=llm_timeout,
         )
     elif toc_strategy == "llm":
         from paddleocr import PaddleOCR
@@ -231,6 +239,7 @@ def bookmark_pdf(
             text_detection_model_dir=os.path.join(model_dir, text_detection_model),
             text_recognition_model_name=text_recognition_model,
             text_recognition_model_dir=os.path.join(model_dir, text_recognition_model),
+            device=device,
         )
         toc_tree1 = build_toc_llm(
             toc_pages,
@@ -243,6 +252,8 @@ def bookmark_pdf(
             llm_model=llm_name,
             llm_api_key=api_key,
             llm_base_url=api_base_url,
+            no_toc_cache=no_toc_cache,
+            llm_timeout=llm_timeout,
         )
     else:
         from paddleocr import PaddleOCR
@@ -259,6 +270,7 @@ def bookmark_pdf(
             text_detection_model_dir=os.path.join(model_dir, text_detection_model),
             text_recognition_model_name=text_recognition_model,
             text_recognition_model_dir=os.path.join(model_dir, text_recognition_model),
+            device=device,
         )
         toc_tree1 = build_toc_local_ocr(
             toc_pages,
@@ -270,7 +282,7 @@ def bookmark_pdf(
             pdf_hash=pdf_hash,
         )
 
-    print_toc_result(toc_tree1)
+    # print_toc_result(toc_tree1)
 
     region_detection_model = "PP-DocBlockLayout"
     make_sure_model_exists(model_dir, region_detection_model)
@@ -300,6 +312,7 @@ def bookmark_pdf(
         # formula_recognition_model_dir=os.path.join(model_dir, formula_recognition_model),
         formula_recognition_batch_size=2,
         format_block_content=True,
+        device=device,
     )
     number_page_results = ocr_number_pages(
         toc_pages,
@@ -316,6 +329,8 @@ def bookmark_pdf(
     logger.debug(f"page_offset: {page_offset}")
 
     # add bookmarks to PDF
+    if not os.path.exists(output):
+        os.makedirs(output)
     pdf_bookmarks_path = os.path.join(output, f"{Path(input).stem}_bookmarked.pdf")
     add_bookmarks_to_pdf(doc, toc_tree1, page_offset, pdf_bookmarks_path)
 

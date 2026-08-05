@@ -14,7 +14,7 @@ def main() -> None:
     parser = ArgumentParser()
     parser.add_argument("--input", type=str, required=True, help="input PDF file")
     parser.add_argument(
-        "--output", type=str, default="output directory", help="output directory"
+        "--output", type=str, default="output", help="output directory"
     )
     parser.add_argument("--log_dir", type=str, default="log", help="log directory")
     parser.add_argument(
@@ -43,6 +43,23 @@ def main() -> None:
         help="visual LLM or multi-modal LLM, like qwen3.6-flash",
     )
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--no_toc_cache",
+        action="store_true",
+        help="re-call the LLM even if a cached TOC tree exists",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="device for PaddleOCR inference: 'cpu', 'gpu', 'gpu:0', etc. (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--llm_timeout",
+        type=float,
+        default=600.0,
+        help="LLM API request timeout in seconds (default: 600)",
+    )
     parser.add_argument("--hash", action="store_true", help="print input file hash and exit")
     args = parser.parse_args()
 
@@ -80,6 +97,9 @@ def main() -> None:
         api_key=api_key,
         llm_name=args.llm_name,
         vllm_name=args.vllm_name,
+        no_toc_cache=args.no_toc_cache,
+        device=args.device,
+        llm_timeout=args.llm_timeout,
     )
     print(
         f"Bookmarked PDF saved to: {pdf_bookmarks_path}, "
