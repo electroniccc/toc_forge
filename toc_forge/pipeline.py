@@ -172,6 +172,7 @@ def bookmark_pdf(
     no_toc_cache: bool = False,
     device: str | None = None,
     llm_timeout: float = 600.0,
+    cpu_threads: int | None = None,
 ) -> tuple[str, float, dict]:
     start_time = time.perf_counter()
     pdf_hash = compute_file_hash(input) if cache_dir else None
@@ -185,10 +186,14 @@ def bookmark_pdf(
     make_sure_model_exists(model_dir, layout_detection_model)
     from paddleocr import LayoutDetection
 
+    # 只在线程数被显式指定时才传入：GUI 用它限制推理线程数（否则 paddlex 默认
+    # 开 10 个 OpenMP 线程占满 CPU，饿死 UI 主循环）；CLI 传 None 保持默认行为。
+    _thread_kwargs = {"cpu_threads": cpu_threads} if cpu_threads else {}
     layout_model = LayoutDetection(
         model_name=layout_detection_model,
         model_dir=os.path.join(model_dir, layout_detection_model),
         device=device,
+        **_thread_kwargs,
     )
     toc_pages, number_pages = get_toc_pages(
         page_imgs,
@@ -240,6 +245,7 @@ def bookmark_pdf(
             text_recognition_model_name=text_recognition_model,
             text_recognition_model_dir=os.path.join(model_dir, text_recognition_model),
             device=device,
+            **_thread_kwargs,
         )
         toc_tree1 = build_toc_llm(
             toc_pages,
@@ -271,6 +277,7 @@ def bookmark_pdf(
             text_recognition_model_name=text_recognition_model,
             text_recognition_model_dir=os.path.join(model_dir, text_recognition_model),
             device=device,
+            **_thread_kwargs,
         )
         toc_tree1 = build_toc_local_ocr(
             toc_pages,
@@ -313,6 +320,7 @@ def bookmark_pdf(
         formula_recognition_batch_size=2,
         format_block_content=True,
         device=device,
+        **_thread_kwargs,
     )
     number_page_results = ocr_number_pages(
         toc_pages,
