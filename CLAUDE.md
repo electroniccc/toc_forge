@@ -101,7 +101,9 @@ The pipeline has five stages (`bookmark_pdf` in `toc_forge/pipeline.py:118`):
 | `toc_forge/ocr_engine.py` | PaddleOCR calls: `get_toc_pages` (layout), `ocr_toc_pages` (text), `ocr_number_pages` (page numbers) |
 | `toc_forge/parsing.py` | Heuristic TOC tree reconstruction: `_parse_toc_lines`, `_build_tree`, `reconstruct_toc1`, `_merge_page_trees`, `_merge_content_box_trees`, `repair_toc_tree`, `_fix_pian_structure`, `_fix_zhang_sections`, `inherit_page_numbers` |
 | `toc_forge/llm.py` | LLM strategies: `build_toc_llm`, `build_toc_vllm`, `_call_llm`, system prompts |
-| `toc_forge/utils.py` | Shared utilities: caching, image processing, model download, numeral helpers (`_section_sort_key`, `_roman_to_int`), `NumpyEncoder`, logging
+| `toc_forge/utils.py` | Shared utilities: caching, image processing, model download, numeral helpers (`_section_sort_key`, `_roman_to_int`), `NumpyEncoder`, logging |
+| `gui_app.py` | Desktop GUI (Tkinter + sv_ttk): strategy selection, model download (3 sources), settings persistence; runs `bookmark_pdf` in a worker thread |
+| `build_gui.ps1` / `build_gui_pyinstaller.ps1` | Nuitka / PyInstaller packaging scripts for the GUI (console-less exe) |
 
 ### OCR models used
 
@@ -143,6 +145,16 @@ class TocNode(TypedDict):
     page_num: int | None  # printed page number, may be inherited from children
     children: list[TocNode]
 ```
+
+## GUI (gui_app.py) — Windows adaptations and known limitations
+
+The desktop GUI works on Windows, but has known limitations that are accepted for now (fixing them is deferred):
+
+- **CPU-only, and slow.** The GUI always passes `device="cpu"` (`gui_app.py`, `_process_pdf`): paddle 3.x's unified wheel bundles CUDA kernels, so on machines with an NVIDIA driver installed, device auto-detection picks `gpu` and tries to load `cudnn64_9.dll` — which the packaged app does not ship, crashing with error code 126. Consequence: OCR runs on CPU only, which is slow for large PDFs.
+- **The UI can still hang or fail to render.** Paddle CPU inference spawns OpenMP threads that saturate all cores (paddlex defaults to 10 threads), starving the tkinter main loop. Mitigation (already applied): `cpu_threads = max(2, os.cpu_count() - 2)` plus `OMP_NUM_THREADS` / `PADDLE_PDX_CPU_NUM_THREADS` env vars, both set in the worker thread **before** the first paddle import; the value is threaded through `bookmark_pdf(..., cpu_threads=...)` to all three inference models (`LayoutDetection`, `PaddleOCR`, `PPStructureV3` via `_thread_kwargs` in `pipeline.py`). This reduces but does not fully eliminate jank — a fully responsive UI would require moving OCR to a separate process (not done).
+- **MKLDNN is enabled by default again.** `enable_mkldnn=False` was previously hard-coded in `pipeline.py` (paddle 3.3.1's oneDNN executor crashes on Windows with "ConvertPirAttribute2RuntimeAttribute does not support ArrayAttribute<DoubleAttribute>") but was removed so Linux runs MKLDNN normally. If Windows CPU inference crashes again, re-disable MKLDNN (ideally behind a flag).
+- **noconsole packaging.** Both build scripts produce console-less exes; `toc_forge/__init__.py` replaces `sys.stdout`/`sys.stderr` with `StringIO` when they are `None`, so `print()` is a no-op instead of crashing.
+- `.gui_settings.json` stores the API key in plaintext — it is gitignored, never commit it.
 
 ## Logging
 
