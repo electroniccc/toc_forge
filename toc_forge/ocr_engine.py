@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import re
+import statistics
 
 from .utils import (
     CachedResult,
@@ -147,61 +149,89 @@ def ocr_toc_pages(
     return toc_results
 
 
-def ocr_number_pages(
-    toc_pages: list[dict],
-    page_imgs,
+def get_number_box_pages(
     number_pages: list[dict],
+    page_imgs,
+) -> list[dict]:
+    """Aggregate per-page number box bounds from layout results, filter by parity-group consistency.
+
+    Layout detection sometimes produces accidental "number" boxes.  Printed page
+    numbers on odd pages mirror those on even pages (e.g. right vs left corner),
+    so within each parity group the boxes should mostly overlap: pages whose box
+    center deviates from the group median are dropped.
+    """
+    from collections import defaultdict
+
+    # aggregate per-page number box bounds, grouped by page parity
+    groups: dict[int, list[dict]] = defaultdict(list)
+    for np_page in number_pages:
+        page_idx = np_page["page"]
+        boxes = np_page["content_boxes"]
+        if not boxes:
+            continue
+        xs = [b["coordinate"][0] for b in boxes]
+        ys = [b["coordinate"][1] for b in boxes]
+        x2s = [b["coordinate"][2] for b in boxes]
+        y2s = [b["coordinate"][3] for b in boxes]
+        groups[page_idx % 2].append(
+            {
+                "page": page_idx,
+                "x1": min(xs),
+                "y1": min(ys),
+                "x2": max(x2s),
+                "y2": max(y2s),
+                "cx": (min(xs) + max(x2s)) / 2,
+                "cy": (min(ys) + max(y2s)) / 2,
+            }
+        )
+
+    # parity-group consistency filter: drop pages whose number box center
+    # deviates too far from the group median (accidental "number" boxes)
+    kept_pages = []
+    for parity, items in groups.items():
+        if not items:
+            continue
+        med_cx = statistics.median(it["cx"] for it in items)
+        med_cy = statistics.median(it["cy"] for it in items)
+        for it in items:
+            h = page_imgs[it["page"]].shape[0]
+            w = page_imgs[it["page"]].shape[1]
+            if (
+                abs(it["cx"] - med_cx) <= 0.25 * w
+                and abs(it["cy"] - med_cy) <= 0.15 * h
+            ):
+                kept_pages.append(it)
+    return kept_pages
+
+
+def ocr_number_boxes(
+    kept_pages: list[dict],
+    page_imgs,
     ocr_model,
     do_debug: bool = False,
     output: str = "output",
-    half_img: bool = False,
     cache_dir: str | None = None,
     pdf_hash: str | None = None,
 ) -> list[dict]:
-    last_toc_page_idx = toc_pages[-1]["page"]
-    number_page_results = []
-    sample_idxs = []
-    page_sample_count = 3
-    for number_page in number_pages:
-        if page_sample_count == 0:
-            break
-        page_idx = number_page["page"]
-        if page_idx <= last_toc_page_idx:
-            continue
-        page_sample_count -= 1
-        sample_idxs.append(page_idx)
-    for i in range(len(number_pages)-3, len(number_pages)):
-        if i < 0:
-            continue
-        number_page = number_pages[i]
-        page_idx = number_page["page"]
-        if page_idx <= last_toc_page_idx:
-            continue
-        if page_idx in sample_idxs:
-            continue
-        sample_idxs.append(page_idx)
-    for page_idx in sample_idxs:
+    """Crop each kept page around its number box (with padding) and OCR the crop.
+
+    Returns a list of {"page": page_idx, "rec_texts": [...]}.  Results are cached
+    per page as "number_ocr" cache entries.
+    """
+    ocr_results = []
+    for it in kept_pages:
+        page_idx = it["page"]
         img = page_imgs[page_idx]
-        img_h_original = img.shape[0]
-        img_y_offset = 0
-        if half_img:
-            boxes = [cb["coordinate"] for cb in number_page["content_boxes"]]
-            if boxes:
-                min_y = min(b[1] for b in boxes)
-                max_y = max(b[3] for b in boxes)
-                if max_y < img_h_original * 0.33:
-                    img = img[: int(img_h_original * 0.33), :]
-                elif max_y < img_h_original * 0.5:
-                    img = img[: int(img_h_original * 0.5), :]
-                elif min_y > img_h_original * 0.67:
-                    img_y_offset = int(img_h_original * 0.67)
-                    img = img[img_y_offset:, :]
-                elif min_y > img_h_original * 0.5:
-                    img_y_offset = int(img_h_original * 0.5)
-                    img = img[img_y_offset:, :]
+        h, w = img.shape[:2]
+        pad = 10
+        x1 = max(0, int(it["x1"]) - pad)
+        y1 = max(0, int(it["y1"]) - pad)
+        x2 = min(w, int(it["x2"]) + pad)
+        y2 = min(h, int(it["y2"]) + pad)
+        crop = img[y1:y2, x1:x2]
 
         cache_path = (
-            _cache_path(cache_dir, pdf_hash, "structure", page_idx)
+            _cache_path(cache_dir, pdf_hash, "number_ocr", page_idx)
             if cache_dir and pdf_hash
             else None
         )
@@ -209,26 +239,96 @@ def ocr_number_pages(
         if cached is not None:
             result = CachedResult(_unwrap_legacy_cache(cached))
         else:
-            results = ocr_model.predict(img)
-            if cache_path:
-                _cache_save(cache_path, _cacheable_dict(results[0]))
-            if do_debug:
-                out_dir = os.path.join(output, f"page_structure_{page_idx}")
-                if not os.path.exists(out_dir):
-                    os.makedirs(out_dir)
-                for res in results:
-                    res.save_to_img(save_path=out_dir)
-                    res.save_to_json(save_path=out_dir)
+            results = ocr_model.predict(crop)
             result = results[0]
+            if cache_path:
+                _cache_save(cache_path, _cacheable_dict(result))
 
-        j_result = result.json["res"]
-        number_page_results.append(
-            {
-                "width": result["width"],
-                "height": img_h_original,
-                "y_offset": img_y_offset,
-                "parsing_res_list": j_result["parsing_res_list"],
-                "pdf_page_idx": page_idx,
-            }
-        )
-    return number_page_results
+        if do_debug:
+            import cv2
+
+            if not os.path.exists(output):
+                os.makedirs(output)
+            cv2.imwrite(
+                os.path.join(output, f"page_number_crop_{page_idx}.png"), crop
+            )
+            with open(
+                os.path.join(output, f"page_number_ocr_{page_idx}.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(
+                    {
+                        "page": page_idx,
+                        "crop_bbox": [x1, y1, x2, y2],
+                        "rec_texts": result["rec_texts"],
+                        "rec_scores": result["rec_scores"],
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                    cls=NumpyEncoder,
+                )
+
+        ocr_results.append({"page": page_idx, "rec_texts": result["rec_texts"]})
+    return ocr_results
+
+
+def compute_page_offset(ocr_results: list[dict]) -> int:
+    """Parse printed page numbers from number-box OCR text and compute the offset.
+
+    offset = pdf_page_idx - printed_page_num; invalid entries (no digits in the
+    OCR text) are skipped, and the mode of the remaining offsets is returned
+    (median on ties) — so isolated OCR misreads (e.g. 6/9 confusion) are tolerated.
+    """
+    offsets = []
+    for res in ocr_results:
+        texts = "".join(res["rec_texts"])
+        page_num = None
+        try:
+            page_num = int(texts.strip())
+        except ValueError:
+            m = re.search(r"\d+", texts)
+            if m:
+                page_num = int(m.group())
+        if page_num is not None:
+            offsets.append(res["page"] - page_num)
+            logger.debug(f"page offset: pdf page {res['page']} -> printed {page_num}")
+
+    if not offsets:
+        logger.warning("compute_page_offset: no valid page numbers found, offset=0")
+        return 0
+    try:
+        return statistics.mode(offsets)
+    except statistics.StatisticsError:
+        # tie — use median for stability
+        return int(statistics.median(offsets))
+
+
+def get_page_offset2(
+    number_pages: list[dict],
+    page_imgs,
+    ocr_model,
+    do_debug: bool = False,
+    output: str = "output",
+    cache_dir: str | None = None,
+    pdf_hash: str | None = None,
+) -> int:
+    """Compute page offset from layout number boxes + PaddleOCR, no PPStructureV3.
+
+    Convenience wrapper around the three stages:
+    ``get_number_box_pages`` (collect/filter number box regions)
+    -> ``ocr_number_boxes`` (OCR the crops)
+    -> ``compute_page_offset`` (parse numbers, take mode offset).
+    """
+    kept_pages = get_number_box_pages(number_pages, page_imgs)
+    ocr_results = ocr_number_boxes(
+        kept_pages,
+        page_imgs,
+        ocr_model,
+        do_debug=do_debug,
+        output=output,
+        cache_dir=cache_dir,
+        pdf_hash=pdf_hash,
+    )
+    return compute_page_offset(ocr_results)

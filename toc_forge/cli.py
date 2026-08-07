@@ -60,6 +60,14 @@ def main() -> None:
         default=600.0,
         help="LLM API request timeout in seconds (default: 600)",
     )
+    parser.add_argument(
+        "--engine",
+        type=str,
+        default=None,
+        help="inference engine for PaddleOCR models: 'paddle', 'paddle_static', "
+        "'paddle_dynamic', 'onnxruntime', etc. (default: PaddleX auto). "
+        "With 'onnxruntime', place an inference.onnx in each model directory.",
+    )
     parser.add_argument("--hash", action="store_true", help="print input file hash and exit")
     args = parser.parse_args()
 
@@ -100,6 +108,7 @@ def main() -> None:
         no_toc_cache=args.no_toc_cache,
         device=args.device,
         llm_timeout=args.llm_timeout,
+        engine=args.engine,
     )
     print(
         f"Bookmarked PDF saved to: {pdf_bookmarks_path}, "

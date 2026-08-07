@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-import fitz
+import pymupdf
 import numpy as np
 from PIL import Image
 
@@ -95,11 +95,11 @@ def _cache_save(path: str, data: Any) -> None:
 
 # ---- Image processing ----
 
-def image_from_page(page: fitz.Page) -> np.ndarray:
-    mat = fitz.Matrix(2, 2)
+def image_from_page(page: pymupdf.Page) -> np.ndarray:
+    mat = pymupdf.Matrix(2, 2)
     pm = page.get_pixmap(matrix=mat, alpha=False)
     if pm.width > 2000 or pm.height > 2000:
-        pm = page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False)
+        pm = page.get_pixmap(matrix=pymupdf.Matrix(1, 1), alpha=False)
     img = Image.frombytes("RGB", [pm.width, pm.height], pm.samples)
     img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     return img

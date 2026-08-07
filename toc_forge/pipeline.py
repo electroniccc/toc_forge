@@ -1,16 +1,16 @@
 """Pipeline orchestration: top-level stages and PDF bookmark injection."""
 
+import gc
 import logging
 import os
-import re
-import statistics
 import time
 from pathlib import Path
 
-import fitz
+import pymupdf
+from paddleocr import PaddleOCR
 
 from .llm import build_toc_llm, build_toc_vllm
-from .ocr_engine import get_toc_pages, ocr_number_pages
+from .ocr_engine import get_page_offset2, get_toc_pages
 from .parsing import inherit_page_numbers, reconstruct_toc1, repair_toc_tree
 from .utils import (
     # _roman_to_int,
@@ -64,43 +64,8 @@ def build_toc_local_ocr(
     return toc_tree1
 
 
-def get_page_offset(number_page_results: list[dict]) -> int:
-    page_offsets = []
-    for result in number_page_results:
-        parsing_res_list = result["parsing_res_list"]
-        height = result["height"]
-        y_off = result.get("y_offset", 0)
-        for res in parsing_res_list:
-            if res["block_label"] != "number":
-                continue
-            y_min = res["block_bbox"][1] + y_off
-            y_max = res["block_bbox"][3] + y_off
-            if y_max <= height * 0.1 or y_min >= height * 0.9:
-                raw = res["block_content"].strip()
-                page_num = None
-                try:
-                    page_num = int(raw)
-                except ValueError:
-                    # page_num = _roman_to_int(raw)
-                    page_num = None
-                if page_num is None:
-                    m = re.search(r"\d+", raw)
-                    if m:
-                        page_num = int(m.group())
-                if page_num is not None:
-                    page_offsets.append(result["pdf_page_idx"] - page_num)
-                break
-    if not page_offsets:
-        return 0
-    try:
-        return statistics.mode(page_offsets)
-    except statistics.StatisticsError:
-        # tie — use median for stability
-        return int(statistics.median(page_offsets))
-
-
 def add_bookmarks_to_pdf(
-    doc: fitz.Document,
+    doc: pymupdf.Document,
     toc_tree: list[dict],
     page_offset: int,
     output_path: str,
@@ -108,7 +73,7 @@ def add_bookmarks_to_pdf(
     """Add PDF outline (bookmarks) from a TOC tree using printed-page -> PDF index mapping."""
 
     def _page_num_to_pdf(page_num: int | str | None) -> int:
-        """Map a printed page number to a 1-based PDF page number (fitz convention)."""
+        """Map a printed page number to a 1-based PDF page number (pymupdf convention)."""
         if isinstance(page_num, int):
             return page_num + page_offset + 1
         if isinstance(page_num, str):
@@ -173,10 +138,11 @@ def bookmark_pdf(
     device: str | None = None,
     llm_timeout: float = 600.0,
     cpu_threads: int | None = None,
+    engine: str | None = None,
 ) -> tuple[str, float, dict]:
     start_time = time.perf_counter()
     pdf_hash = compute_file_hash(input) if cache_dir else None
-    doc = fitz.open(input)
+    doc = pymupdf.open(input)
     page_imgs = []
     for i in range(min(50, doc.page_count)):
         page = doc[i]
@@ -189,11 +155,15 @@ def bookmark_pdf(
     # 只在线程数被显式指定时才传入：GUI 用它限制推理线程数（否则 paddlex 默认
     # 开 10 个 OpenMP 线程占满 CPU，饿死 UI 主循环）；CLI 传 None 保持默认行为。
     _thread_kwargs = {"cpu_threads": cpu_threads} if cpu_threads else {}
+    # 仅当显式指定引擎时才传入（如 engine="onnxruntime" 使用模型目录下的
+    # inference.onnx 推理，避免依赖 paddle 运行时）；None 保持 PaddleX 默认。
+    _engine_kwargs = {"engine": engine} if engine else {}
     layout_model = LayoutDetection(
         model_name=layout_detection_model,
         model_dir=os.path.join(model_dir, layout_detection_model),
         device=device,
         **_thread_kwargs,
+        **_engine_kwargs,
     )
     toc_pages, number_pages = get_toc_pages(
         page_imgs,
@@ -203,6 +173,11 @@ def bookmark_pdf(
         cache_dir=cache_dir,
         pdf_hash=pdf_hash,
     )
+    # 布局检测完成后布局模型不再需要，显式释放：onnxruntime 的 CUDA arena 对
+    # 动态 shape 会膨胀到数 GB 且不自动归还，与 OCR 模型的 session 叠加可撑爆
+    # 6GB 显存导致推理变慢；del + gc 后 onnxruntime session 销毁会归还显存。
+    del layout_model
+    gc.collect()
     if not toc_pages:
         print("未检测到目录页")
         return "", 0, {}
@@ -214,6 +189,25 @@ def bookmark_pdf(
     make_sure_model_exists(model_dir, text_detection_model)
     text_recognition_model = "PP-OCRv5_server_rec"
     make_sure_model_exists(model_dir, text_recognition_model)
+
+    # 无论哪种策略都创建 OCR 模型：llm/local_ocr 用它做目录 OCR，
+    # 页码扫描（get_page_offset2）也需要它，vllm 策略同样需要。
+    ocr_model = PaddleOCR(
+        use_doc_orientation_classify=True,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        doc_orientation_classify_model_dir=os.path.join(
+            model_dir, doc_ori_classify_model
+        ),
+        doc_orientation_classify_model_name=doc_ori_classify_model,
+        text_detection_model_name=text_detection_model,
+        text_detection_model_dir=os.path.join(model_dir, text_detection_model),
+        text_recognition_model_name=text_recognition_model,
+        text_recognition_model_dir=os.path.join(model_dir, text_recognition_model),
+        device=device,
+        **_thread_kwargs,
+        **_engine_kwargs,
+    )
 
     if toc_strategy == "vllm":
         toc_tree1 = build_toc_vllm(
@@ -230,23 +224,6 @@ def bookmark_pdf(
             llm_timeout=llm_timeout,
         )
     elif toc_strategy == "llm":
-        from paddleocr import PaddleOCR
-
-        ocr_model = PaddleOCR(
-            use_doc_orientation_classify=True,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            doc_orientation_classify_model_dir=os.path.join(
-                model_dir, doc_ori_classify_model
-            ),
-            doc_orientation_classify_model_name=doc_ori_classify_model,
-            text_detection_model_name=text_detection_model,
-            text_detection_model_dir=os.path.join(model_dir, text_detection_model),
-            text_recognition_model_name=text_recognition_model,
-            text_recognition_model_dir=os.path.join(model_dir, text_recognition_model),
-            device=device,
-            **_thread_kwargs,
-        )
         toc_tree1 = build_toc_llm(
             toc_pages,
             page_imgs,
@@ -262,23 +239,6 @@ def bookmark_pdf(
             llm_timeout=llm_timeout,
         )
     else:
-        from paddleocr import PaddleOCR
-
-        ocr_model = PaddleOCR(
-            use_doc_orientation_classify=True,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            doc_orientation_classify_model_dir=os.path.join(
-                model_dir, doc_ori_classify_model
-            ),
-            doc_orientation_classify_model_name=doc_ori_classify_model,
-            text_detection_model_name=text_detection_model,
-            text_detection_model_dir=os.path.join(model_dir, text_detection_model),
-            text_recognition_model_name=text_recognition_model,
-            text_recognition_model_dir=os.path.join(model_dir, text_recognition_model),
-            device=device,
-            **_thread_kwargs,
-        )
         toc_tree1 = build_toc_local_ocr(
             toc_pages,
             page_imgs,
@@ -291,50 +251,22 @@ def bookmark_pdf(
 
     # print_toc_result(toc_tree1)
 
-    region_detection_model = "PP-DocBlockLayout"
-    make_sure_model_exists(model_dir, region_detection_model)
-    # formula_recognition_model = "PP-FormulaNet_plus-L"
-    # make_sure_model_exists(model_dir, formula_recognition_model)
-    from paddleocr import PPStructureV3
-
-    structure_model = PPStructureV3(
-        use_table_recognition=False,
-        use_formula_recognition=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-        use_doc_orientation_classify=True,
-        doc_orientation_classify_model_name=doc_ori_classify_model,
-        doc_orientation_classify_model_dir=os.path.join(
-            model_dir, doc_ori_classify_model
-        ),
-        region_detection_model_name=region_detection_model,
-        region_detection_model_dir=os.path.join(model_dir, region_detection_model),
-        text_detection_model_name=text_detection_model,
-        text_detection_model_dir=os.path.join(model_dir, text_detection_model),
-        text_recognition_model_name=text_recognition_model,
-        text_recognition_model_dir=os.path.join(model_dir, text_recognition_model),
-        layout_detection_model_name=layout_detection_model,
-        layout_detection_model_dir=os.path.join(model_dir, layout_detection_model),
-        # formula_recognition_model_name=formula_recognition_model,
-        # formula_recognition_model_dir=os.path.join(model_dir, formula_recognition_model),
-        formula_recognition_batch_size=2,
-        format_block_content=True,
-        device=device,
-        **_thread_kwargs,
-    )
-    number_page_results = ocr_number_pages(
-        toc_pages,
-        page_imgs,
+    # 页码偏移：直接用布局检测的 number box 位置截取小图 + PaddleOCR 扫描
+    # （get_page_offset2），不再调用 PPStructureV3（加载子模型多、耗时长）。
+    page_offset = get_page_offset2(
         number_pages,
-        structure_model,
+        page_imgs,
+        ocr_model,
         do_debug=do_debug,
         output=output,
-        half_img=False,
         cache_dir=cache_dir,
         pdf_hash=pdf_hash,
     )
-    page_offset = get_page_offset(number_page_results)
     logger.debug(f"page_offset: {page_offset}")
+
+    # OCR 模型用完即释放（onnxruntime 的 CUDA arena 显存不自动归还）
+    del ocr_model
+    gc.collect()
 
     # add bookmarks to PDF
     if not os.path.exists(output):
