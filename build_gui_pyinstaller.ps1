@@ -6,7 +6,17 @@ param(
 $ErrorActionPreference = "Stop"
 
 $mainScript = "gui_app.py"
-$outputName = "TOC-Forge"
+
+# 版本号取自 toc_forge.__version__（toc_forge/__init__.py），拼进产物名
+# （exe/目录/zip 一并带上），便于区分不同版本的分发包
+$version = (& python -c 'from toc_forge import __version__; print(__version__)' 2>$null | Select-Object -First 1)
+if ($version) {
+    $version = "-$($version.Trim())"
+} else {
+    Write-Host "WARNING: 读取 toc_forge.__version__ 失败，产物名将不带版本号" -ForegroundColor Yellow
+    $version = ""
+}
+$outputName = "TOC-Forge$version"
 
 # 清理上次构建产物。PyInstaller 的 --noconfirm 只会删 dist\TOC-Forge 目录本身，
 # 残留的旧 onefile exe / zip 需要手动清掉，避免 onefile/onedir 切换时混淆
@@ -26,6 +36,11 @@ $PyInstallerArgs = @(
     "--collect-all=paddle",
     "--collect-all=paddleocr",
     "--collect-all=paddlex",
+    # GUI 固定用 onnxruntime 引擎（gui_app.py 里 engine="onnxruntime"）：
+    # capi 下的 onnxruntime_pybind11_state.pyd + onnxruntime.dll 等二进制
+    # 依赖运行时目录，collect-all 整包收集最稳。注意构建环境必须已安装
+    # onnxruntime（建议 1.27，1.28 的 get_available_providers() 有 bug）
+    "--collect-all=onnxruntime",
     # sv_ttk 的 tcl 主题文件（sv.tcl / theme/）是数据文件，导入分析不自动收集
     "--collect-all=sv_ttk",
     # 本地包：editable 安装下 PyInstaller 的查找偶尔不稳，显式给路径
@@ -85,6 +100,25 @@ $PyInstallerArgs = @(
     "--exclude-module=latex2mathml",
     "--exclude-module=pkg_resources"
 )
+
+# onnxruntime 引擎：paddlex 的依赖检查以 importlib.metadata 判定 onnxruntime
+# 是否可用，缺 .dist-info 会被判为不可用。注意 .venv-onnx 装的是
+# onnxruntime-gpu（dist-info 目录名 onnxruntime_gpu-*.dist-info），而 .venv 装
+# 的是 onnxruntime —— PyInstaller 的 copy_metadata 按元数据包名查找，两个
+# 环境包名不同，这里动态检测取实际名字
+$ortMeta = & python -c @"
+import importlib.metadata as m
+for name in ('onnxruntime-gpu', 'onnxruntime'):
+    try:
+        m.version(name)
+        print(name)
+        break
+    except Exception:
+        pass
+"@
+if ($ortMeta) {
+    $PyInstallerArgs += "--copy-metadata=$ortMeta"
+}
 
 if ($Debug) {
     $PyInstallerArgs += "--console"

@@ -47,6 +47,8 @@ python -m toc_forge --input <pdf_path> --output <output_dir> [--model_dir ./mode
 - `--device`: device for PaddleOCR inference — `cpu`, `gpu`, `gpu:0`, etc. (default: auto-detect)
 - `--llm_timeout`: LLM API request timeout in seconds (default: `600`). Increase if using slow reasoning models.
 - `--engine`: inference engine for PaddleOCR models — `paddle`, `paddle_static`, `paddle_dynamic`, `onnxruntime`, etc. (default: PaddleX auto). With `onnxruntime`, each model directory must contain an `inference.onnx` — see "ONNX Runtime engine" below.
+- `--disable_mkldnn`: disable MKLDNN for CPU inference (workaround for the paddle 3.3.1 oneDNN executor crash on Windows, `ConvertPirAttribute2RuntimeAttribute`). Sets `PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=false` in `cli.py` **before** importing paddle — the `enable_mkldnn` kwarg is a no-op in paddlex 3.5.2/3.7.2 (verified), the env var is the real switch. Default: MKLDNN on (Linux runs it normally). Only affects the paddle engine — ignored by `onnxruntime`.
+- `--ocr_model_size`: OCR det/rec model size — `server` (default, higher accuracy) or `mobile` (much faster on CPU, what the GUI uses). With `--engine onnxruntime`, the chosen model directory must contain `inference.onnx` (see "ONNX Runtime engine").
 
 Output: `{output}/{input_stem}_bookmarked.pdf` with injected PDF outline.
 
@@ -103,20 +105,23 @@ The pipeline has five stages (`bookmark_pdf` in `toc_forge/pipeline.py:118`):
 | `toc_forge/parsing.py` | Heuristic TOC tree reconstruction: `_parse_toc_lines`, `_build_tree`, `reconstruct_toc1`, `_merge_page_trees`, `_merge_content_box_trees`, `repair_toc_tree`, `_fix_pian_structure`, `_fix_zhang_sections`, `inherit_page_numbers` |
 | `toc_forge/llm.py` | LLM strategies: `build_toc_llm`, `build_toc_vllm`, `_call_llm`, system prompts |
 | `toc_forge/utils.py` | Shared utilities: caching, image processing, model download, numeral helpers (`_section_sort_key`, `_roman_to_int`), `NumpyEncoder`, logging |
-| `gui_app.py` | Desktop GUI (Tkinter + sv_ttk): strategy selection, model download (3 sources), settings persistence; runs `bookmark_pdf` in a worker thread |
+| `gui_app.py` | Desktop GUI (Tkinter + sv_ttk): strategy selection, model download (2 onnx sources: ModelScope / HuggingFace `{name}_onnx` repos), settings persistence; runs `bookmark_pdf` (onnxruntime engine, CPU) in a worker thread |
 | `build_gui.ps1` / `build_gui_pyinstaller.ps1` | Nuitka / PyInstaller packaging scripts for the GUI (console-less exe) |
 
 ### OCR models used
 
-The pipeline downloads/caches five PaddleOCR models via `make_sure_model_exists()`:
+The pipeline downloads/caches four PaddleOCR model types via `make_sure_model_exists()`:
 
 | Model | Stage |
 |---|---|
 | `PP-DocLayout_plus-L` | Layout detection |
 | `PP-LCNet_x1_0_doc_ori` | Document orientation classification |
-| `PP-OCRv5_server_det` | Text detection |
-| `PP-OCRv5_server_rec` | Text recognition |
-| `PP-DocBlockLayout` | Region detection — no longer used by the pipeline (was for the removed PPStructureV3 page-number scan); files may still exist in `models/` |
+| `PP-OCRv5_{server,mobile}_det` | Text detection (size per `--ocr_model_size`) |
+| `PP-OCRv5_{server,mobile}_rec` | Text recognition (size per `--ocr_model_size`) |
+
+`PP-DocBlockLayout` is **not used** — it was region detection for the removed PPStructureV3 page-number scan; it is gone from the GUI download list (`_MODEL_NAMES` in `gui_app.py`), though its files may still exist in `models/`.
+
+**`PP-DocLayout-M` was evaluated and rejected.** It has no official `_onnx` repo; the onnx comes from RapidDoc (ModelScope `RapidAI/RapidDoc`, `layout/PP-DocLayout-M/pp_doclayout_m.onnx`), verified bit-identical in output to the official paddle weights on the same pages (paddle2onnx itself fails to load against paddle 3.3.1: `DLL load failed … 找不到指定的程序`). It runs ~2× faster than plus-L (0.10–0.12 s vs ~0.25 s per page) but detects far fewer boxes on TOC pages (e.g. 0 vs 3, 8 vs 20) — page 4 of the test book produced **zero** boxes, which makes `bookmark_pdf` exit with "未检测到目录页". The pipeline stays on `PP-DocLayout_plus-L`; the downloaded model dir may still exist under `models/`.
 
 Models are downloaded from `paddle-model-ecology.bj.bcebos.com` if not found locally, or copied from `PADDLE_PDX_CACHE_HOME/official_models` if already cached there.
 
@@ -151,13 +156,20 @@ class TocNode(TypedDict):
 
 The desktop GUI works on Windows, but has known limitations that are accepted for now (fixing them is deferred):
 
-- **CPU-only, and slow.** The GUI always passes `device="cpu"` (`gui_app.py`, `_process_pdf`): paddle 3.x's unified wheel bundles CUDA kernels, so on machines with an NVIDIA driver installed, device auto-detection picks `gpu` and tries to load `cudnn64_9.dll` — which the packaged app does not ship, crashing with error code 126. Consequence: OCR runs on CPU only, which is slow for large PDFs.
-- **The UI can still hang or fail to render.** Paddle CPU inference spawns OpenMP threads that saturate all cores (paddlex defaults to 10 threads), starving the tkinter main loop. Mitigation (already applied): `cpu_threads = max(2, os.cpu_count() - 2)` plus `OMP_NUM_THREADS` / `PADDLE_PDX_CPU_NUM_THREADS` env vars, both set in the worker thread **before** the first paddle import; the value is threaded through `bookmark_pdf(..., cpu_threads=...)` to both inference models (`LayoutDetection`, `PaddleOCR` via `_thread_kwargs` in `pipeline.py`). This reduces but does not fully eliminate jank — a fully responsive UI would require moving OCR to a separate process (not done).
-- **MKLDNN is enabled by default again.** `enable_mkldnn=False` was previously hard-coded in `pipeline.py` (paddle 3.3.1's oneDNN executor crashes on Windows with "ConvertPirAttribute2RuntimeAttribute does not support ArrayAttribute<DoubleAttribute>") but was removed so Linux runs MKLDNN normally. If Windows CPU inference crashes again, re-disable MKLDNN (ideally behind a flag).
+- **CPU-only, and runs the onnxruntime engine.** The GUI always passes `device="cpu"` + `engine="onnxruntime"` (`gui_app.py`, `_process_pdf`). CPU-only because paddle 3.x's unified wheel bundles CUDA kernels — on machines with an NVIDIA driver installed, device auto-detection would pick `gpu` and try to load `cudnn64_9.dll`, which the packaged app does not ship, crashing with error code 126. The onnxruntime engine was adopted because its CPU inference is substantially faster than the paddle engine (measured ~37 s end-to-end, cold cache, for a full textbook with mobile models; the paddle engine took ~3 min 15 s for the same flow). OCR is still CPU-only, so large PDFs remain slow.
+- **The UI can still hang or fail to render.** Paddle CPU inference spawns OpenMP threads that saturate all cores (paddlex defaults to 10 threads), starving the tkinter main loop. Mitigation (already applied): `cpu_threads = max(2, os.cpu_count() - 2)` plus `OMP_NUM_THREADS` / `PADDLE_PDX_CPU_NUM_THREADS` env vars, both set in the worker thread **before** the first paddle import; the value is threaded through `bookmark_pdf(..., cpu_threads=...)` to both inference models (`LayoutDetection`, `PaddleOCR` via `_engine_kwargs` in `pipeline.py`). This reduces but does not fully eliminate jank — a fully responsive UI would require moving OCR to a separate process (not done).
+- **GUI uses mobile OCR models.** CPU-only means server det/rec are painfully slow (measured ~89 s per TOC page vs ~28 s for mobile, i.e. 3.2× faster on the same page). The GUI passes `ocr_model_size="mobile"` (`PP-OCRv5_mobile_det`/`PP-OCRv5_mobile_rec`), and `_MODEL_NAMES` in `gui_app.py` downloads the mobile pair. Slightly lower accuracy than server — if TOC parsing quality drops, switch back via the `ocr_model_size` param (CLI: `--ocr_model_size server`). CLI default stays `"server"`.
+- **MKLDNN is irrelevant for the GUI now (onnxruntime engine).** The oneDNN executor crash (`ConvertPirAttribute2RuntimeAttribute`, paddle 3.3.1, Windows CPU) only affects the paddle engine — and the `enable_mkldnn` kwarg is a **no-op in paddlex 3.5.2 and 3.7.2** (verified by grepping the installed packages; the parameter no longer exists). The real switch is the `PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT` env var, which the CLI sets under `--disable_mkldnn` (`cli.py`). The GUI still passes `enable_mkldnn=False` — harmless; it just doesn't do anything. All engine-related kwargs (`engine`, `cpu_threads`, `enable_mkldnn`) are collected into `_engine_kwargs` in `pipeline.py` and forwarded to the two model constructors (`LayoutDetection`, `PaddleOCR`).
+- **PDF multi-select.** `_browse_pdf` uses `askopenfilenames`; multiple paths are joined with `os.pathsep` (`;` on Windows — NTFS filenames can't contain it) in the `pdf_path_var` StringVar, which also makes manual `;`-separated input work. `_process_pdf` validates each path (exists + `.pdf`) and processes files **serially** in a worker thread; the first failure aborts with the offending filename in the error message. `_on_done` shows `done` for one file or `done_multi` (`已完成 {n}/{total} 个文件`) for several. OCR cache is per-file-hash, so re-runs of previously processed files are fast.
+- **Action-button reset on PDF change.** After a successful run the button becomes "打开输出目录" (pointing at the old document's output). A `trace_add("write")` on `pdf_path_var` resets it to "生成书签" whenever the path changes (browse or manual edit), unless processing is running.
+- **Model downloads are onnx-only.** Because the GUI runs the onnxruntime engine, every model directory needs `inference.onnx` (+ `inference.yml`). `_MODEL_FILES` in `gui_app.py` downloads exactly these two files from the official `PaddlePaddle/{name}_onnx` repos (ModelScope / HuggingFace). The former Baidu tar source was removed — its archives are paddle-format only and contain no onnx. `all_models_exist` / `_download_model` check for the `inference.onnx` file (not the directory), so pre-existing paddle-format model dirs are re-downloaded automatically.
+- **PyInstaller packaging collects onnxruntime.** `build_gui_pyinstaller.ps1` adds `--collect-all=onnxruntime` (the capi `.pyd`/`.dll` are loaded by path at runtime). The `--copy-metadata` package name is auto-detected at build time — `.venv-onnx` installs `onnxruntime-gpu` (dist-info `onnxruntime_gpu-*.dist-info`), `.venv` installs `onnxruntime`; PyInstaller's `copy_metadata` needs the exact metadata name, so the script probes both and passes whichever exists (paddlex's dependency check reads `importlib.metadata`). Build environment must have onnxruntime installed (1.27 recommended — 1.28's `get_available_providers()` misreports CUDA/TensorRT).
+- **Build output carries the version.** The script reads `toc_forge.__version__` (`toc_forge/__init__.py`) and names every artifact `TOC-Forge-{version}` (exe / onedir / zip). Reading failure degrades to plain `TOC-Forge` with a warning. Bump the version in `__init__.py` to change the artifact name. PyInstaller's generated `TOC-Forge-{version}.spec` is gitignored (`TOC-Forge*.spec`).
+- **onnxruntime-gpu inflates the package by ~1 GB.** Building with `.venv-onnx` (onnxruntime-gpu) pulls in nvidia CUDA DLLs (cublasLt 435 MB + cufft 277 MB + cublas 49 MB at the dist root) plus `onnxruntime_providers_cuda.dll` 233 MB — the zip grew from 0.9 GB to 1.4 GB — none of which the CPU-only GUI ever uses. Build with `.venv-onnx-cpu` (CPU-only onnxruntime 1.27) instead; see the ONNX section below.
 - **noconsole packaging.** Both build scripts produce console-less exes; `toc_forge/__init__.py` replaces `sys.stdout`/`sys.stderr` with `StringIO` when they are `None`, so `print()` is a no-op instead of crashing.
 - `.gui_settings.json` stores the API key in plaintext — it is gitignored, never commit it.
 
-## ONNX Runtime engine (optional, Linux)
+## ONNX Runtime engine (optional)
 
 PaddleX 支持用 onnxruntime 引擎推理，避免依赖 paddle 运行时（例如 `.venv-onnx` 里
 被 uv 解析到的 `paddlepaddle-gpu==2.6.2` 与 paddleocr 3.7.0 不兼容，但 ONNX 引擎
@@ -172,15 +184,27 @@ source .set_onnx_env.sh          # 把 cuDNN/cuBLAS 库路径加进 LD_LIBRARY_P
   paddleocr 相关库。必须用 **onnxruntime 1.27** —— 1.28 有 bug：
   `get_available_providers()` 不报告 CUDA/TensorRT（只报 CPU/Azure），导致 PaddleX
   的 provider 检测误判；1.27 正常。
+- **`.venv-onnx-cpu`（Windows，推荐 GUI 打包构建环境）**：python 3.12 +
+  **onnxruntime 1.27 CPU 版** + paddlex 3.7.2 + paddle 3.3.1。CPU 版
+  onnxruntime 没有 nvidia pip 依赖，PyInstaller 打包不会收集 CUDA DLL ——
+  用 `.venv-onnx`（onnxruntime-gpu）打包会膨胀 ~1 GB（见 GUI 章节）。paddle
+  引擎在 paddlex 3.7.2 下无法关闭 MKLDNN（参数已移除），paddle 3.3.1 的
+  oneDNN 崩溃无解，**该环境只能跑 onnxruntime 引擎**（GUI 正好是）。
 - **GPU 依赖**：onnxruntime CUDA provider 需要 `libcudnn.so.9` / `libcublas.so.13`，
   由 pip 包 `nvidia-cudnn-cu13`（9.24.0.43）和 `nvidia-cublas`（13.6.1.10）提供，
   装在 `.venv-onnx` 内。`.set_onnx_env.sh` 在运行前扩展 `LD_LIBRARY_PATH` 指向
   `site-packages/nvidia/{cudnn,cublas}/lib`，否则 provider 加载失败。
-- **模型转换**：每个模型目录需含 `inference.onnx`（模型文件前缀为 `inference`）。
-  用 `paddlex --paddle2onnx -m <model_dir> -s <output_dir>` 转换（需
-  `paddle2onnx==2.0.2rc3`）。当前 `models/` 下 5 个模型均已转换
-  （PP-DocLayout_plus-L、PP-LCNet_x1_0_doc_ori、PP-OCRv5_server_det、
-  PP-OCRv5_server_rec、PP-DocBlockLayout）。
+- **模型来源**：每个模型目录需含 `inference.onnx`（模型文件前缀为 `inference`）。
+  两个途径：① 官方发布（推荐）—— PaddlePaddle 组织在 HuggingFace / ModelScope
+  上有 `{model_name}_onnx` 仓库（如 `PaddlePaddle/PP-OCRv5_server_det_onnx`），
+  含 `inference.onnx` + `inference.yml`，直接下载放进模型目录即可（官方
+  README 用法即 `--engine onnxruntime`）；② 本地转换 —— `paddlex
+  --paddle2onnx -m <model_dir> -s <output_dir>`（需 `paddle2onnx==2.0.2rc3`，
+  且要求 paddle ≥ 3.0.0.dev20250426，因此 Windows 的 `.venv-onnx`
+  （paddle 2.6.2）**不能本地转换**，只能走官方仓库）。当前 `models/` 下
+  7 个模型目录均已含 `inference.onnx`（server det/rec 为本地转换，layout /
+  doc_ori / DocBlockLayout 及 mobile det/rec 为官方仓库下载），与 paddle
+  格式并存，两种引擎共用目录。
 - **实测性能**：布局检测推理 CPU 0.497 s/page → GPU 0.251 s/page。
 - **显存管理（重要）**：onnxruntime 的 CUDA arena 对动态 shape（rec 文本行宽度
   每次不同）按 2 的幂扩展且不归还显存，每个模型 session 会膨胀到 2-4 GB。
@@ -192,10 +216,42 @@ source .set_onnx_env.sh          # 把 cuDNN/cuBLAS 库路径加进 LD_LIBRARY_P
   销毁会归还显存）+ 移除 PPStructureV3 后，完整 pipeline onnxruntime GPU
   冷缓存 29s < paddle GPU 40s，热缓存 ~11s。
 
-代码侧：`--engine` 通过 `bookmark_pdf(..., engine=...)` → `_engine_kwargs` 传给全部
-4 个模型实例（`LayoutDetection`、`PaddleOCR`×2、`PPStructureV3`），`None` 时保持
-PaddleX 默认。
+代码侧：`--engine` 通过 `bookmark_pdf(..., engine=...)` → `_engine_kwargs` 传给两个
+模型实例（`LayoutDetection`、`PaddleOCR`，PPStructureV3 已随页码扫描重构移除），
+`None` 时保持 PaddleX 默认。`_engine_kwargs` 还承载 `cpu_threads` 与
+`enable_mkldnn`（见 GUI 章节）。
+
+## ONNX Runtime engine — Windows 差异
+
+- **GPU 不可用，静默降级 CPU**：Windows 的 `.venv-onnx` 未装 `nvidia-cudnn-cu13`
+  / `nvidia-cublas`（Linux 环境才有，见上节），onnxruntime 创建
+  `CUDAExecutionProvider` 失败（日志：`Failed to create CUDAExecutionProvider.
+  Require cuDNN 9.* and CUDA 13.*`）后自动回退 CPU，pipeline 照常完成。
+  实测 Windows CPU 全流程 ~3min15s（无缓存）。要启用 Windows GPU 需 pip 装
+  上述两个包 + 运行时 `os.add_dll_directory()`（打包场景还需 PyInstaller
+  显式收集 nvidia DLL，见 gui_app 打包注意事项）。
+- **`.venv-onnx`（Windows）**：paddleocr 3.7.0 + paddlex 3.7.2 +
+  onnxruntime-gpu 1.27（1.27 的要求同 Linux）+ paddlepaddle-gpu 2.6.2（与
+  paddleocr 3.7 不兼容，只能走 onnxruntime 引擎）。onnxruntime-gpu 会把
+  CUDA/nvidia DLL 拉进 PyInstaller 包（~1 GB 纯浪费，见 GUI 章节），**打包
+  请用 `.venv-onnx-cpu`** 而不是它。
+- **`.venv-onnx-cpu`（Windows）**：python 3.12 + onnxruntime 1.27 **CPU 版**
+  + paddlex 3.7.2 + paddle 3.3.1。**GUI 打包推荐构建环境**：CPU 版无
+  nvidia 依赖，包体积正常；paddle 引擎因 MKLDNN 无法关闭不可用（3.7.2 已
+  移除开关），只能跑 onnxruntime 引擎（GUI 正好是）。
+- **`.venv`（Windows）**：paddle 3.3.1 + paddleocr 3.5.0。要跑 onnxruntime
+  引擎（CLI `--engine onnxruntime` 或 GUI）需先 `pip install onnxruntime`
+  （1.27）；onnxruntime 引擎不依赖 paddle 推理，与 paddle 引擎共存于同一
+  环境没问题。GUI 若坚持在 `.venv` 里跑，装上即可。
+- **常见报错**：`ValueError: No valid model files were found for engine
+  'onnxruntime'.` —— 模型目录缺 `inference.onnx`（布局/方向/区域模型常被
+  漏掉），从 ModelScope `PaddlePaddle/{name}_onnx` 下载补齐即可（layout
+  ~124 MB、doc_ori ~6.5 MB、DocBlockLayout ~123 MB）。
 
 ## Logging
 
 Logs go to `log/toc_forge.log` via `setup_logger`. Uses `logging.DEBUG` level, file-only (no console handler). LLM calls also log via `logger.info` / `logger.warning`.
+
+Stage timing is logged at DEBUG level in `ocr_engine.py` (per stage, covering both
+cached and inference paths — `layout detection cost: Xs (N pages, cached|inference)`,
+`OCR toc pages cost: Xs (N pages)`, `OCR number pages cost: Xs (N pages)`).

@@ -2,9 +2,7 @@
 import json
 import locale
 import os
-import shutil
 import subprocess
-import tempfile
 import threading
 import time
 import tkinter as tk
@@ -18,25 +16,20 @@ import sv_ttk
 _MODEL_NAMES = [
     "PP-DocLayout_plus-L",
     "PP-LCNet_x1_0_doc_ori",
-    "PP-OCRv5_server_det",
-    "PP-OCRv5_server_rec",
-    "PP-DocBlockLayout",
+    "PP-OCRv5_mobile_det",
+    "PP-OCRv5_mobile_rec",
 ]
-_BOS_BASE_URL = (
-    "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model"
-)
-_BOS_VERSION = "paddle3.0.0"
 
-# 每个推理模型由 3 个文件组成；BOS 是打包的 tar，ModelScope/HF 是散文件（内容一致）
-_MODEL_FILES = ("inference.yml", "inference.json", "inference.pdiparams")
+# GUI 固定使用 onnxruntime 引擎（bookmark_pdf 里 engine="onnxruntime"），
+# 每个模型只需 2 个文件：inference.onnx + inference.yml。
+# 官方 onnx 版仓库为 PaddlePaddle/{name}_onnx（ModelScope / HuggingFace 均有）。
+_MODEL_FILES = ("inference.yml", "inference.onnx")
 _MODEL_SOURCES = {
-    "baidu": None,  # tar 归档，走 _download_tar
-    "modelscope": "https://www.modelscope.cn/models/PaddlePaddle/{name}/resolve/master/{file}",
-    "huggingface": "https://huggingface.co/PaddlePaddle/{name}/resolve/main/{file}",
+    "modelscope": "https://www.modelscope.cn/models/PaddlePaddle/{name}_onnx/resolve/master/{file}",
+    "huggingface": "https://huggingface.co/PaddlePaddle/{name}_onnx/resolve/main/{file}",
 }
 # (key, i18n label) — Combobox 显示 label，取值用 key
 _SOURCE_KEYS = [
-    ("baidu", "src_baidu"),
     ("modelscope", "src_modelscope"),
     ("huggingface", "src_huggingface"),
 ]
@@ -71,6 +64,7 @@ _T = {
         "vllm": "Vision LLM",
         "api_url": "API Base URL",
         "api_key": "API Key",
+        "api_hint": "Use an OpenAI-compatible API",
         "io_group": "Input / Output",
         "input_pdf": "Input PDF",
         "output_dir": "Output",
@@ -78,7 +72,6 @@ _T = {
         "model_group": "Model directory",
         "model_path": "Path",
         "model_source": "Source",
-        "src_baidu": "Baidu (Official)",
         "src_modelscope": "ModelScope (Alibaba)",
         "src_huggingface": "HuggingFace",
         "models_ok": "All models present.",
@@ -92,6 +85,7 @@ _T = {
         "need_models": "Download models first.",
         "extracting": "Extracting table of contents …",
         "done": "Done ({t:.1f}s)  —  {name}",
+        "done_multi": "Done {n}/{total} files — last: {name}",
         "error_see_below": "Error — see details below",
         "dl_exists": "{name} already exists",
         "dl_downloading": "Downloading {name} …",
@@ -110,6 +104,7 @@ _T = {
         "vllm": "视觉 LLM",
         "api_url": "API 地址",
         "api_key": "API 密钥",
+        "api_hint": "请使用OpenAI格式的API接口",
         "io_group": "输入 / 输出",
         "input_pdf": "输入 PDF",
         "output_dir": "输出目录",
@@ -118,7 +113,6 @@ _T = {
         "model_group": "模型目录",
         "model_path": "路径",
         "model_source": "下载源",
-        "src_baidu": "百度官方",
         "src_modelscope": "阿里 ModelScope",
         "src_huggingface": "HuggingFace",
         "models_ok": "所有模型已就位。",
@@ -132,6 +126,7 @@ _T = {
         "need_models": "请先下载模型。",
         "extracting": "正在提取目录 …",
         "done": "完成 ({t:.1f}秒)  —  {name}",
+        "done_multi": "已完成 {n}/{total} 个文件 — 最后一个：{name}",
         "error_see_below": "错误 — 详情见下方",
         "dl_exists": "{name} 已存在",
         "dl_downloading": "正在下载 {name} …",
@@ -182,36 +177,8 @@ def _stream_download(url: str, dst: str, progress_cb: Callable[[float], None] | 
     raise requests.ConnectionError(f"download failed after {retries} attempts: {last_err}")
 
 
-def _download_tar(model_dir: str, model_name: str, progress_cb: Callable[[str, float], None] | None) -> None:
-    """百度官方源：下载 {name}_infer.tar 并解压到 model_dir/{name}/。"""
-    target = os.path.join(model_dir, model_name)
-    url = f"{_BOS_BASE_URL}/{_BOS_VERSION}/{model_name}_infer.tar"
-    if progress_cb:
-        progress_cb(t("dl_downloading", name=model_name), 0)
-
-    def _prog(frac: float) -> None:
-        if progress_cb:
-            progress_cb(t("dl_downloading", name=model_name), frac)
-
-    with tempfile.TemporaryDirectory() as td:
-        arc_path = os.path.join(td, f"{model_name}_infer.tar")
-        _stream_download(url, arc_path, _prog)
-
-        if progress_cb:
-            progress_cb(t("dl_extracting", name=model_name), 1.0)
-        extract_dir = os.path.join(td, "extract")
-        shutil.unpack_archive(arc_path, extract_dir)
-        entries = os.listdir(extract_dir)
-        src = os.path.join(extract_dir, entries[0] if len(entries) == 1 else model_name)
-        if os.path.isdir(src):
-            shutil.copytree(src, target, symlinks=True)
-        else:
-            os.makedirs(target, exist_ok=True)
-            shutil.copy2(src, target)
-
-
 def _download_model_files(model_dir: str, model_name: str, source: str, progress_cb: Callable[[str, float], None] | None) -> None:
-    """ModelScope / HuggingFace 源：逐文件下载 3 个推理文件（与 BOS tar 内容一致）。"""
+    """ModelScope / HuggingFace 源：从 {name}_onnx 仓库逐文件下载 onnx 推理文件。"""
     template = _MODEL_SOURCES[source]
     n = len(_MODEL_FILES)
     target = os.path.join(model_dir, model_name)
@@ -231,24 +198,23 @@ def _download_model_files(model_dir: str, model_name: str, source: str, progress
         _stream_download(url, dst, _prog)
 
 
-def _download_model(model_dir: str, model_name: str, source: str = "baidu", progress_cb: Callable[[str, float], None] | None = None) -> None:
+def _download_model(model_dir: str, model_name: str, source: str = "modelscope", progress_cb: Callable[[str, float], None] | None = None) -> None:
     target = os.path.join(model_dir, model_name)
-    if os.path.isdir(target):
+    # 存在性以 inference.onnx 为准：onnxruntime 引擎只认 onnx 文件，
+    # 旧的 paddle 格式目录（无 onnx）会被重新下载补全
+    if os.path.isfile(os.path.join(target, "inference.onnx")):
         if progress_cb:
             progress_cb(t("dl_exists", name=model_name), 1.0)
         return
 
     os.makedirs(model_dir, exist_ok=True)
-    if source == "baidu":
-        _download_tar(model_dir, model_name, progress_cb)
-    else:
-        _download_model_files(model_dir, model_name, source, progress_cb)
+    _download_model_files(model_dir, model_name, source, progress_cb)
 
     if progress_cb:
         progress_cb(t("dl_ready", name=model_name), 1.0)
 
 
-def download_all_models(model_dir: str, source: str = "baidu", progress_cb: Callable[[str, float], None] | None = None) -> None:
+def download_all_models(model_dir: str, source: str = "modelscope", progress_cb: Callable[[str, float], None] | None = None) -> None:
     """Download all models in parallel; overall progress = mean of per-model progress."""
     n = len(_MODEL_NAMES)
     lock = threading.Lock()
@@ -275,7 +241,11 @@ def download_all_models(model_dir: str, source: str = "baidu", progress_cb: Call
 
 
 def all_models_exist(model_dir: str) -> bool:
-    return all(os.path.isdir(os.path.join(model_dir, n)) for n in _MODEL_NAMES)
+    # 目录存在不算数：onnxruntime 引擎需要每个模型目录含 inference.onnx
+    return all(
+        os.path.isfile(os.path.join(model_dir, n, "inference.onnx"))
+        for n in _MODEL_NAMES
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +348,10 @@ class TocForgeApp:
         ttk.Label(self.model_name_row, text=t("model_name"), width=14).pack(side=tk.LEFT)
         self.model_name_var = tk.StringVar()
         ttk.Entry(self.model_name_row, textvariable=self.model_name_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(
+            self.api_frame, text=t("api_hint"),
+            foreground="#888",
+        ).pack(anchor=tk.W, pady=(4, 0))
 
         # --- file paths ---
         path_frame = ttk.LabelFrame(main, text=t("io_group"), padding="12 8 12 12")
@@ -387,6 +361,9 @@ class TocForgeApp:
         pdf_row.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(pdf_row, text=t("input_pdf"), width=14).pack(side=tk.LEFT)
         self.pdf_path_var = tk.StringVar()
+        # PDF 路径变化（Browse 或手动输入）时复位按钮：上次处理成功会把按钮
+        # 切成"打开输出目录"指向旧文档输出，换新文档后继续显示会误导
+        self.pdf_path_var.trace_add("write", self._on_pdf_path_changed)
         ttk.Entry(pdf_row, textvariable=self.pdf_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(pdf_row, text=t("browse"), command=self._browse_pdf).pack(side=tk.RIGHT, padx=(8, 0))
 
@@ -465,7 +442,7 @@ class TocForgeApp:
         self.pdf_path_var.set(s.get("pdf_path", ""))
         self.output_dir_var.set(s.get("output_dir", ""))
         self.model_dir_var.set(s.get("model_dir", "./models"))
-        self._set_source(str(s.get("model_source", "baidu")))
+        self._set_source(str(s.get("model_source", "modelscope")))
         self.api_url_var.set(s.get("api_url", ""))
         self.api_key_var.set(s.get("api_key", ""))
         self.model_name_var.set(s.get("model_name", ""))
@@ -490,7 +467,7 @@ class TocForgeApp:
         for key, label in _SOURCE_KEYS:
             if t(label) == display:
                 return key
-        return "baidu"
+        return "modelscope"
 
     def _set_source(self, key: str) -> None:
         for k, label in _SOURCE_KEYS:
@@ -511,6 +488,11 @@ class TocForgeApp:
             self._open_dir(self._last_output_dir)
         else:
             self._process_pdf()
+
+    def _on_pdf_path_changed(self, *_args: object) -> None:
+        # 处理中（按钮显示"processing"）不打扰，交给 _on_done/_on_error 收尾
+        if not self._running:
+            self._switch_to_process_btn()
 
     def _switch_to_open_btn(self) -> None:
         self.process_btn.configure(text=t("open_output"))
@@ -555,11 +537,11 @@ class TocForgeApp:
         self._persist_settings()
 
     def _browse_pdf(self) -> None:
-        path = filedialog.askopenfilename(
+        paths = filedialog.askopenfilenames(
             filetypes=[(t("file_pdf"), "*.pdf"), (t("file_all"), "*.*")],
         )
-        if path:
-            self.pdf_path_var.set(path)
+        if paths:
+            self.pdf_path_var.set(os.pathsep.join(paths))
             self._persist_settings()
 
     def _browse_output(self) -> None:
@@ -648,11 +630,20 @@ class TocForgeApp:
     def _process_pdf(self) -> None:
         if self._running:
             return
-        pdf_path = self.pdf_path_var.get().strip()
-        if not pdf_path or not os.path.isfile(pdf_path):
+        # 支持多选：路径以 os.pathsep 分隔（Windows 为 ';'，NTFS 文件名不含该字符）
+        pdf_paths = [
+            p.strip()
+            for p in self.pdf_path_var.get().split(os.pathsep)
+            if p.strip()
+        ]
+        if not pdf_paths:
             self.status_var.set(t("select_pdf"))
             return
-        if not pdf_path.lower().endswith(".pdf"):
+        bad = [p for p in pdf_paths if not os.path.isfile(p)]
+        if bad:
+            self.status_var.set(t("select_pdf"))
+            return
+        if any(not p.lower().endswith(".pdf") for p in pdf_paths):
             self.status_var.set(t("pdf_only"))
             return
         output_dir = self.output_dir_var.get().strip() or "output"
@@ -695,38 +686,61 @@ class TocForgeApp:
                 model_name = self.model_name_var.get().strip() or None
                 llm_name = model_name if strategy == "llm" else None
                 vllm_name = model_name if strategy == "vllm" else None
-                pdf_out, elapsed, _ = toc_forge.bookmark_pdf(
-                    input=pdf_path,
-                    output=output_dir,
-                    model_dir=model_dir,
-                    cache_dir="./.ocr_cache",
-                    toc_strategy=strategy,
-                    api_base_url=api_base,
-                    api_key=api_key,
-                    llm_name=llm_name,
-                    vllm_name=vllm_name,
-                    # 强制 CPU：paddle 3.x 统一 wheel 自带 CUDA 内核，在装了 N 卡驱动
-                    # 的机器上会自动选 gpu 并尝试加载 cudnn64_9.dll，而打包程序不带
-                    # CUDA/cuDNN 库，会直接崩溃（error code 126）
-                    device="cpu",
-                    cpu_threads=ocr_threads,
-                )
-                self.root.after(0, lambda: self._on_done(pdf_out, elapsed))
+                # 串行处理每个文件；任一个失败即中断并标注文件名
+                results = []
+                for pdf_path in pdf_paths:
+                    try:
+                        pdf_out, elapsed, _ = toc_forge.bookmark_pdf(
+                            input=pdf_path,
+                            output=output_dir,
+                            model_dir=model_dir,
+                            cache_dir="./.ocr_cache",
+                            toc_strategy=strategy,
+                            api_base_url=api_base,
+                            api_key=api_key,
+                            llm_name=llm_name,
+                            vllm_name=vllm_name,
+                            # 强制 CPU：paddle 3.x 统一 wheel 自带 CUDA 内核，在装了 N 卡驱动
+                            # 的机器上会自动选 gpu 并尝试加载 cudnn64_9.dll，而打包程序不带
+                            # CUDA/cuDNN 库，会直接崩溃（error code 126）
+                            device="cpu",
+                            cpu_threads=ocr_threads,
+                            # Windows CPU 推理必须关闭 MKLDNN：paddle 3.3.1 的 oneDNN 新执行器
+                            # 崩溃（ConvertPirAttribute2RuntimeAttribute 不支持
+                            # ArrayAttribute<DoubleAttribute>，onednn_instruction.cc:118），
+                            # 打包版实测必崩；Linux 不受影响（走默认启用）
+                            enable_mkldnn=False,
+                            # GUI 只有 CPU 可用，用 mobile OCR（PP-OCRv5_mobile_det/rec）
+                            # 大幅缩短推理时间；精度略低，需要更高精度时改回 server
+                            ocr_model_size="mobile",
+                            engine="onnxruntime"
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(f"{os.path.basename(pdf_path)}: {exc}") from exc
+                    results.append((pdf_out, elapsed))
+                total = len(pdf_paths)
+                self.root.after(0, lambda: self._on_done(results, total))
             except Exception as exc:
                 err_msg = str(exc)
                 self.root.after(0, lambda m=err_msg: self._on_error(m))
 
         threading.Thread(target=_work, daemon=True).start()
 
-    def _on_done(self, pdf_out: str, elapsed: float) -> None:
+    def _on_done(self, results: list[tuple[str, float]], total: int) -> None:
         self._running = False
+        pdf_out, elapsed = results[-1]
         self._last_output_dir = os.path.dirname(pdf_out)
         self.process_progress.stop()
         self.process_progress.pack_forget()
         self.process_btn.configure(state=tk.NORMAL)
         self._switch_to_open_btn()
         self.error_text.pack_forget()
-        self.status_var.set(t("done", t=elapsed, name=os.path.basename(pdf_out)))
+        if len(results) == 1:
+            self.status_var.set(t("done", t=elapsed, name=os.path.basename(pdf_out)))
+        else:
+            self.status_var.set(
+                t("done_multi", n=len(results), total=total, name=os.path.basename(pdf_out))
+            )
 
     def _on_error(self, msg: str) -> None:
         self._running = False

@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import statistics
+import time
 
 from .utils import (
     CachedResult,
@@ -29,6 +30,7 @@ def get_toc_pages(
     cache_dir: str | None = None,
     pdf_hash: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
+    t0 = time.perf_counter()
     cached_results = None
     if cache_dir and pdf_hash:
         cached = []
@@ -94,6 +96,10 @@ def get_toc_pages(
         if content_boxes:
             content_boxes = deduplicate_content_boxes(content_boxes)
             pages_with_number.append({"page": res_i, "content_boxes": content_boxes})
+    logger.debug(
+        f"layout detection cost: {time.perf_counter() - t0:.2f}s "
+        f"({len(imgs)} pages, {'cached' if cached_results is not None else 'inference'})"
+    )
     return toc_pages, pages_with_number
 
 
@@ -106,6 +112,7 @@ def ocr_toc_pages(
     cache_dir: str | None = None,
     pdf_hash: str | None = None,
 ) -> list[dict]:
+    t0 = time.perf_counter()
     toc_results = []
     for toc_page in toc_pages:
         page_idx = toc_page["page"]
@@ -146,6 +153,9 @@ def ocr_toc_pages(
         toc_results.append(
             {"page": page_idx, "angle": angle, "content_boxes": toc_result}
         )
+    logger.debug(
+        f"OCR toc pages cost: {time.perf_counter() - t0:.2f}s ({len(toc_pages)} pages)"
+    )
     return toc_results
 
 
@@ -218,6 +228,7 @@ def ocr_number_boxes(
     Returns a list of {"page": page_idx, "rec_texts": [...]}.  Results are cached
     per page as "number_ocr" cache entries.
     """
+    t0 = time.perf_counter()
     ocr_results = []
     for it in kept_pages:
         page_idx = it["page"]
@@ -271,6 +282,9 @@ def ocr_number_boxes(
                 )
 
         ocr_results.append({"page": page_idx, "rec_texts": result["rec_texts"]})
+    logger.debug(
+        f"OCR number pages cost: {time.perf_counter() - t0:.2f}s ({len(kept_pages)} pages)"
+    )
     return ocr_results
 
 

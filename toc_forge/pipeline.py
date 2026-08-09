@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 import pymupdf
-from paddleocr import PaddleOCR
+from paddleocr import LayoutDetection, PaddleOCR
 
 from .llm import build_toc_llm, build_toc_vllm
 from .ocr_engine import get_page_offset2, get_toc_pages
@@ -139,6 +139,8 @@ def bookmark_pdf(
     llm_timeout: float = 600.0,
     cpu_threads: int | None = None,
     engine: str | None = None,
+    enable_mkldnn: bool | None = None,
+    ocr_model_size: str = "server",
 ) -> tuple[str, float, dict]:
     start_time = time.perf_counter()
     pdf_hash = compute_file_hash(input) if cache_dir else None
@@ -150,19 +152,27 @@ def bookmark_pdf(
         page_imgs.append(img)
     layout_detection_model = "PP-DocLayout_plus-L"
     make_sure_model_exists(model_dir, layout_detection_model)
-    from paddleocr import LayoutDetection
 
-    # 只在线程数被显式指定时才传入：GUI 用它限制推理线程数（否则 paddlex 默认
-    # 开 10 个 OpenMP 线程占满 CPU，饿死 UI 主循环）；CLI 传 None 保持默认行为。
-    _thread_kwargs = {"cpu_threads": cpu_threads} if cpu_threads else {}
-    # 仅当显式指定引擎时才传入（如 engine="onnxruntime" 使用模型目录下的
-    # inference.onnx 推理，避免依赖 paddle 运行时）；None 保持 PaddleX 默认。
-    _engine_kwargs = {"engine": engine} if engine else {}
+    # 引擎行为只在被显式指定时才传入，None 保持 PaddleX 默认：
+    # - engine: 如 "onnxruntime" 时使用模型目录下的 inference.onnx 推理，
+    #   避免依赖 paddle 运行时（WSL/Linux 已验证）
+    # - cpu_threads: GUI 用它限制推理线程数（否则 paddlex 默认开 10 个 OpenMP
+    #   线程占满 CPU，饿死 UI 主循环）
+    # - enable_mkldnn: False 时关闭 MKLDNN —— paddle 3.3.1 的 oneDNN 新执行器
+    #   在 Windows CPU 推理有 bug（ConvertPirAttribute2RuntimeAttribute 不支持
+    #   ArrayAttribute<DoubleAttribute>，onednn_instruction.cc:118 崩溃），
+    #   打包版 GUI 必须关闭；Linux 传 None 保持默认（启用）。
+    _engine_kwargs = {}
+    if engine:
+        _engine_kwargs["engine"] = engine
+    if cpu_threads:
+        _engine_kwargs["cpu_threads"] = cpu_threads
+    if enable_mkldnn is not None:
+        _engine_kwargs["enable_mkldnn"] = enable_mkldnn
     layout_model = LayoutDetection(
         model_name=layout_detection_model,
         model_dir=os.path.join(model_dir, layout_detection_model),
         device=device,
-        **_thread_kwargs,
         **_engine_kwargs,
     )
     toc_pages, number_pages = get_toc_pages(
@@ -185,9 +195,15 @@ def bookmark_pdf(
 
     doc_ori_classify_model = "PP-LCNet_x1_0_doc_ori"
     make_sure_model_exists(model_dir, doc_ori_classify_model)
-    text_detection_model = "PP-OCRv5_server_det"
+    # OCR 模型规格：server（默认，精度高）或 mobile（CPU 上快一个量级，
+    # GUI 打包版只有 CPU 可用，用 mobile 控制耗时）
+    if ocr_model_size == "mobile":
+        text_detection_model = "PP-OCRv5_mobile_det"
+        text_recognition_model = "PP-OCRv5_mobile_rec"
+    else:
+        text_detection_model = "PP-OCRv5_server_det"
+        text_recognition_model = "PP-OCRv5_server_rec"
     make_sure_model_exists(model_dir, text_detection_model)
-    text_recognition_model = "PP-OCRv5_server_rec"
     make_sure_model_exists(model_dir, text_recognition_model)
 
     # 无论哪种策略都创建 OCR 模型：llm/local_ocr 用它做目录 OCR，
@@ -205,7 +221,6 @@ def bookmark_pdf(
         text_recognition_model_name=text_recognition_model,
         text_recognition_model_dir=os.path.join(model_dir, text_recognition_model),
         device=device,
-        **_thread_kwargs,
         **_engine_kwargs,
     )
 

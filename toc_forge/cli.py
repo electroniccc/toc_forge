@@ -68,6 +68,21 @@ def main() -> None:
         "'paddle_dynamic', 'onnxruntime', etc. (default: PaddleX auto). "
         "With 'onnxruntime', place an inference.onnx in each model directory.",
     )
+    parser.add_argument(
+        "--disable_mkldnn",
+        action="store_true",
+        help="disable MKLDNN for CPU inference (workaround for the paddle 3.3.1 "
+        "oneDNN executor crash on Windows). Sets "
+        "PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=false before importing paddle",
+    )
+    parser.add_argument(
+        "--ocr_model_size",
+        type=str,
+        default="server",
+        choices=["server", "mobile"],
+        help="OCR model size: 'server' (default, higher accuracy) or "
+        "'mobile' (much faster on CPU, used by the GUI)",
+    )
     parser.add_argument("--hash", action="store_true", help="print input file hash and exit")
     args = parser.parse_args()
 
@@ -81,6 +96,13 @@ def main() -> None:
         print("model dir required")
         return
     setup_logger(args.log_dir)
+
+    # 必须在 paddle 首次 import（发生在 bookmark_pdf 内部）之前设置：
+    # paddlex 3.5.2 的 run_mode 默认按 PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT
+    # 决定是否用 oneDNN（paddle 3.3.1 Windows CPU 推理会崩）；enable_mkldnn
+    # 参数在 3.5.2/3.7.2 均不消费，环境变量才是真正的开关
+    if args.disable_mkldnn:
+        os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "false"
 
     api_base_url = args.api_base_url or os.environ.get("OPENAI_BASE_URL")
     api_key = args.api_key or os.environ.get("OPENAI_API_KEY")
@@ -109,6 +131,8 @@ def main() -> None:
         device=args.device,
         llm_timeout=args.llm_timeout,
         engine=args.engine,
+        enable_mkldnn=False if args.disable_mkldnn else None,
+        ocr_model_size=args.ocr_model_size,
     )
     print(
         f"Bookmarked PDF saved to: {pdf_bookmarks_path}, "

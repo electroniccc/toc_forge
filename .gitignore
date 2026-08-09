@@ -8,7 +8,7 @@ wheels/
 
 # Virtual environments
 .claude
-.venv
+.venv*
 .ocr_cache
 models
 output
@@ -16,7 +16,7 @@ temp
 log
 
 nuitka-crash-report.xml
-TOC-Forge.spec
+TOC-Forge*.spec
 
 # GUI 运行时设置（含明文 API key）与调试残留
 .gui_settings.json
