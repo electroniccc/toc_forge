@@ -10,7 +10,13 @@ import pymupdf
 from paddleocr import LayoutDetection, PaddleOCR
 
 from .llm import build_toc_llm, build_toc_vllm
-from .ocr_engine import get_page_offset2, get_toc_pages
+from .ocr_engine import (
+    detect_toc_pages_by_continuity,
+    detect_toc_pages_by_keyword,
+    get_page_offset2,
+    get_toc_pages,
+    keep_longest_contiguous_pages,
+)
 from .parsing import inherit_page_numbers, reconstruct_toc1, repair_toc_tree
 from .utils import (
     # _roman_to_int,
@@ -175,7 +181,7 @@ def bookmark_pdf(
         device=device,
         **_engine_kwargs,
     )
-    toc_pages, number_pages = get_toc_pages(
+    toc_pages, number_pages, all_boxes = get_toc_pages(
         page_imgs,
         layout_model,
         do_debug=do_debug,
@@ -188,9 +194,6 @@ def bookmark_pdf(
     # 6GB 显存导致推理变慢；del + gc 后 onnxruntime session 销毁会归还显存。
     del layout_model
     gc.collect()
-    if not toc_pages:
-        print("未检测到目录页")
-        return "", 0, {}
     logger.debug(f"number_pages: {number_pages}")
 
     doc_ori_classify_model = "PP-LCNet_x1_0_doc_ori"
@@ -223,6 +226,44 @@ def bookmark_pdf(
         device=device,
         **_engine_kwargs,
     )
+
+    # 布局漏检的目录页补充：页面上部有 paragraph_title 或页角 header 的文本为
+    # "Contents"/"目录" 时也判为目录页（如英文教材 CONTENTS 页眉页，Layout
+    # 只标了 text/header 而没有 content box）；补充页无 content box，OCR 过滤
+    # 用合成的整页框（排除页眉页脚带与命中的标题框，避免 "CONTENTS v" 之类
+    # 被解析成目录条目）。
+    toc_pages.extend(
+        detect_toc_pages_by_keyword(
+            all_boxes,
+            page_imgs,
+            ocr_model,
+            skip={p["page"] for p in toc_pages},
+            do_debug=do_debug,
+            output=output,
+            cache_dir=cache_dir,
+            pdf_hash=pdf_hash,
+        )
+    )
+    # 目录页连续传播：英文书目录常跨多页，但只有首页带 "Contents" 标题
+    # （如 OpenStax），后续页没有关键词可依；对已确认目录页的后续页检查
+    # "行尾带页码"风格（"4.10 Antiderivatives 419"），符合则续上目录页。
+    toc_pages.extend(
+        detect_toc_pages_by_continuity(
+            toc_pages,
+            all_boxes,
+            page_imgs,
+            ocr_model,
+            do_debug=do_debug,
+            output=output,
+            cache_dir=cache_dir,
+            pdf_hash=pdf_hash,
+        )
+    )
+    # 目录页去噪：只保留最大连续页段，丢弃孤立误检（如 [5, 7, 8, 9] -> [7, 8, 9]）
+    toc_pages = keep_longest_contiguous_pages(toc_pages)
+    if not toc_pages:
+        print("未检测到目录页")
+        return "", 0, {}
 
     if toc_strategy == "vllm":
         toc_tree1 = build_toc_vllm(

@@ -11,7 +11,7 @@ wheels/
 .venv*
 .ocr_cache
 models
-output
+output*
 temp
 log
 
