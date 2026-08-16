@@ -22,9 +22,12 @@ from .ocr_engine import (
     ocr_number_boxes,
 )
 from .page_map import (
+    build_arabic_page_map,
     build_front_matter_offset,
     build_page_map,
     detect_roman_arabic_format,
+    detect_segmented_offset,
+    map_arabic_page,
     map_page_num,
 )
 from .parsing import inherit_page_numbers, reconstruct_toc1, repair_toc_tree
@@ -87,6 +90,7 @@ def add_bookmarks_to_pdf(
     output_path: str,
     page_map: dict[str, int] | None = None,
     front_offset: int | None = None,
+    arabic_segments: list[dict] | None = None,
 ) -> None:
     """Add PDF outline (bookmarks) from a TOC tree using printed-page -> PDF index mapping.
 
@@ -101,6 +105,9 @@ def add_bookmarks_to_pdf(
     def _page_num_to_pdf(page_num: int | str | None) -> int:
         """Map a printed page number to a 1-based PDF page number (pymupdf convention)."""
         if isinstance(page_num, int):
+            mapped = map_arabic_page(arabic_segments, page_num)
+            if mapped is not None:
+                return mapped + 1
             return page_num + page_offset + 1
         if isinstance(page_num, str):
             mapped = map_page_num(page_map, page_num)
@@ -400,6 +407,30 @@ def bookmark_pdf(
             else "roman page map: format detected but no entries found"
         )
 
+    # 分段页码映射：有些书（如 Shankar）印刷页码与 PDF 索引不是单一线性
+    # 关系（章节边界跳号）。先抽样各章起始页检查 offset 是否一致，只有
+    # 发现分段才全书扫描构建段表（书签 int 页码先查段表，段内线性、
+    # 段间空洞取最近段反推）——单 offset 的书抽样即可，省去全书扫描。
+    arabic_segments = None
+    if detect_segmented_offset(
+        doc,
+        ocr_model,
+        toc_tree1,
+        page_offset,
+        number_pages,
+        page_imgs,
+        cache_dir=cache_dir,
+        pdf_hash=pdf_hash,
+    ):
+        arabic_segments = build_arabic_page_map(
+            doc,
+            ocr_model,
+            number_pages,
+            page_imgs,
+            cache_dir=cache_dir,
+            pdf_hash=pdf_hash,
+        )
+
     # OCR 模型用完即释放（onnxruntime 的 CUDA arena 显存不自动归还）
     del ocr_model
     gc.collect()
@@ -415,6 +446,7 @@ def bookmark_pdf(
         pdf_bookmarks_path,
         page_map=page_map,
         front_offset=front_offset,
+        arabic_segments=arabic_segments,
     )
 
     def update_page_offset(toc_tree1, page_offset):

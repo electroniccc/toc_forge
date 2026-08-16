@@ -408,6 +408,188 @@ def build_front_matter_offset(
     return int(statistics.median(offsets))
 
 
+def detect_segmented_offset(
+    doc,
+    ocr_model,
+    toc_tree: list[dict],
+    page_offset: int,
+    number_pages: list[dict],
+    page_imgs,
+    cache_dir: str | None = None,
+    pdf_hash: str | None = None,
+) -> bool:
+    """Sample chapter-start pages to check whether the pdf↔printed offset is
+    segmented (some books skip printed page numbers at chapter boundaries,
+    e.g. Shankar: offset 13 for pages 1-73, offset 12 from 76 on).
+
+    For every root entry with an int page number X, estimate its PDF page
+    (X + page_offset), read the printed number actually printed there (text
+    layer first, OCR crop fallback), and compare: any mismatch means the
+    offset changed and a full scan (build_arabic_page_map) is warranted.
+    A book with a single constant offset costs only a handful of page reads.
+    """
+    regions = _page_number_regions(number_pages, page_imgs)
+    samples = [
+        node["page_num"]
+        for node in toc_tree
+        if isinstance(node.get("page_num"), int) and node["page_num"] > 0
+    ]
+    for X in samples:
+        est = X + page_offset
+        if est < 0 or est >= doc.page_count:
+            continue
+        Y = _text_layer_page_number(doc, est)
+        if Y is None and regions:
+            for t in _ocr_page_numbers(
+                doc, est, ocr_model, regions, cache_dir, pdf_hash
+            ):
+                t = t.strip()
+                if re.fullmatch(r"\d{1,4}", t):
+                    Y = int(t)
+                    break
+        if Y is not None and Y != X:
+            logger.info(
+                f"segmented offset detected: chapter at printed {X} "
+                f"reads {Y} on pdf page {est} (offset {page_offset})"
+            )
+            return True
+    return False
+
+
+def _text_layer_page_number(doc, page_idx: int) -> int | None:
+    """Read a page's printed number from the PDF text layer, if it has one.
+
+    Scanned PDFs (e.g. Shankar) have no text layer and return None — the
+    caller falls back to OCR.  Only digits at the page edges (bottom band,
+    or top corners) are accepted so formula/body numbers don't match.
+    """
+    page = doc[page_idx]
+    words = page.get_text("words")
+    if not words:
+        return None
+    h = page.rect.height
+    w = page.rect.width
+    for wd in words:
+        x0, y0, x1, y1, text = wd[:5]
+        if not re.fullmatch(r"\d{1,4}", text):
+            continue
+        if y0 > 0.88 * h:
+            return int(text)
+        if y0 < 0.12 * h and (x0 < 0.35 * w or x1 > 0.65 * w):
+            return int(text)
+    return None
+
+
+def build_arabic_page_map(
+    doc,
+    ocr_model,
+    number_pages: list[dict],
+    page_imgs,
+    cache_dir: str | None = None,
+    pdf_hash: str | None = None,
+) -> list[dict] | None:
+    """Scan every page's printed page number and segment the pdf↔printed
+    offset.
+
+    Some books' printed page numbers are not a single linear function of the
+    PDF index: Shankar's "Principles of Quantum Mechanics" runs offset 13
+    for pages 1-73, offset 12 from 76 on, and drifts further (the book skips
+    printed numbers at chapter boundaries; the Answers/Index section shifts
+    again).  A single mode offset then lands bookmarks 1-2 pages late.
+
+    Returns a segment list sorted by printed page: [{"printed_start",
+    "pdf_start", "printed_end"}, ...] where pdf indexes are 0-based and
+    ``pdf = pdf_start + (printed - printed_start)`` inside a segment.
+    Single-page segments (isolated OCR misreads, e.g. a formula digit in the
+    page-number crop) are dropped.  Per-page OCR reuses the "page_map_ocr"
+    cache.  Returns None when nothing was scanned.
+    """
+    regions = _page_number_regions(number_pages, page_imgs)
+    if not regions:
+        return None
+
+    pairs = []  # (pdf_idx, printed_page) with consecutive pdf indices
+    for idx in range(doc.page_count):
+        # text layer first — nearly free; OCR fallback only for scanned PDFs
+        printed = _text_layer_page_number(doc, idx)
+        if printed is None:
+            for t in _ocr_page_numbers(
+                doc, idx, ocr_model, regions, cache_dir, pdf_hash
+            ):
+                t = t.strip()
+                if re.fullmatch(r"\d{1,4}", t):
+                    printed = int(t)
+                    break
+        if printed is not None:
+            pairs.append((idx, printed))
+    if len(pairs) < 2:
+        return None
+
+    # split into runs of equal offset (printed - pdf constant across gaps)
+    segments: list[dict] = []
+    cur = {"printed_start": pairs[0][1], "pdf_start": pairs[0][0], "printed_end": pairs[0][1]}
+    for (p_prev, x_prev), (p, x) in zip(pairs, pairs[1:]):
+        if x - p == x_prev - p_prev:
+            cur["printed_end"] = x
+        else:
+            segments.append(cur)
+            cur = {"printed_start": x, "pdf_start": p, "printed_end": x}
+    segments.append(cur)
+
+    # drop single-page segments — likely OCR noise (a body-text digit read
+    # in the page-number crop)
+    kept = [s for s in segments if s["printed_end"] > s["printed_start"]]
+    if len(kept) < len(segments):
+        logger.debug(
+            f"build_arabic_page_map: dropped {len(segments) - len(kept)} "
+            f"single-page segment(s) as noise"
+        )
+    if not kept:
+        return None
+    logger.info(
+        f"arabic page map: {len(kept)} segments, "
+        f"{len(pairs)} pages scanned"
+    )
+    return kept
+
+
+def map_arabic_page(
+    segments: list[dict] | None, page_num
+) -> int | None:
+    """Map a printed Arabic page number to a 0-based PDF index via the
+    segment table.
+
+    Inside a segment the offset is linear; a page number that falls into a
+    gap between segments (a printed number the book skips — e.g. Shankar's
+    74/75) is resolved from whichever segment end is closer, so chapter title
+    pages with no printed number still resolve to the right PDF page.
+    Returns None when the number cannot be mapped.
+    """
+    if not segments or not isinstance(page_num, int):
+        return None
+    X = page_num
+    s_prev = None
+    s_next = None
+    for s in segments:
+        if s["printed_start"] <= X:
+            s_prev = s
+        elif s_next is None:
+            s_next = s
+    if s_prev is not None and X <= s_prev["printed_end"]:
+        return s_prev["pdf_start"] + (X - s_prev["printed_start"])
+    if s_prev is not None and s_next is not None:
+        d_prev = X - s_prev["printed_end"]
+        d_next = s_next["printed_start"] - X
+        if d_next < d_prev:
+            return s_next["pdf_start"] - (s_next["printed_start"] - X)
+        return s_prev["pdf_start"] + (X - s_prev["printed_start"])
+    if s_prev is not None:
+        return s_prev["pdf_start"] + (X - s_prev["printed_start"])
+    if s_next is not None:
+        return s_next["pdf_start"] - (s_next["printed_start"] - X)
+    return None
+
+
 def map_page_num(page_map: dict[str, int] | None, page_num) -> int | None:
     """Convert a "X-n" page number to cumulative Arabic via ``page_map``.
 
