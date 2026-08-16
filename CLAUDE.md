@@ -67,9 +67,7 @@ The pipeline has five stages (`bookmark_pdf` in `toc_forge/pipeline.py:118`):
    - **`llm`**: runs local OCR first, then sends OCR JSON to a text LLM (`build_toc_llm`). Selected when `--api_base_url`, `--api_key`, and `--llm_name` are set but `--vllm_name` is not.
    - **`vllm`**: sends TOC page images directly to a vision LLM, skipping local OCR (`build_toc_vllm`). Selected when all three of `--api_base_url`, `--api_key`, and `--vllm_name` are set.
 
-   For `local_ocr`, three heuristic parsers exist:
-   - `reconstruct_toc` (legacy): purely semantic — regex patterns for chapter/section/subsection, KMeans fallback.
-   - `reconstruct_toc_indent` (legacy): pure indentation clustering on x-coordinates.
+   For `local_ocr`, one heuristic parser exists:
    - `reconstruct_toc1` (**the active/default strategy**): per-page level detection + cross-page merge. Level assignment is **geometry-driven and language-agnostic**:
      1. **Gap-tree clustering**: x-coordinate gaps determine baseline indentation levels for all entries on a page.
      2. **Paragraph-title depth**: consecutive `paragraph_title` entries above a content box form a nesting chain (first → level 0, second → level 1, …). Content entries are shifted by the number of consecutive paragraph_titles above them.

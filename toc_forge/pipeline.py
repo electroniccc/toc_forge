@@ -36,7 +36,6 @@ from .utils import (
     compute_file_hash,
     image_from_page,
     make_sure_model_exists,
-    # print_toc_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -339,8 +338,6 @@ def bookmark_pdf(
             cache_dir=cache_dir,
             pdf_hash=pdf_hash,
         )
-
-    # print_toc_result(toc_tree1)
 
     # 页码偏移：直接用布局检测的 number box 位置截取小图 + PaddleOCR 扫描
     # （get_page_offset2），不再调用 PPStructureV3（加载子模型多、耗时长）。

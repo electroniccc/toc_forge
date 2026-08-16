@@ -255,12 +255,6 @@ class NumberPageResult(dict):
     """TypedDict-alike for page-number detection results."""
 
 
-def print_toc_result(toc_result: list[dict[str, Any]], indent: int = 0) -> None:
-    for node in toc_result:
-        print("  " * indent + node["title"] + f" (page {node['page_num']})")
-        print_toc_result(node["children"], indent + 2)
-
-
 # ---- Logging and model management ----
 
 def setup_logger(log_dir: str) -> None:
