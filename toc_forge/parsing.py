@@ -135,6 +135,10 @@ def _parse_toc_lines(
 
         roman_pat = re.compile(r"^[IVXLCDMivxlcdm]+$")
         digit_pat = re.compile(r"^\d+$")
+        # roman chapter + within-chapter page: "I-1", "II-24" — kept as a
+        # string page number; the page-map module converts it to cumulative
+        # Arabic before bookmark injection
+        roman_arabic_pat = re.compile(r"^[IVXLCDMivxlcdm]+-\d+$")
         # dot chars: ASCII dot, fullwidth dot (U+FF0E), ellipsis, middle dot
         _DOT_CHARS = ".．…·"
         trailed_pat = re.compile(rf"^[{_DOT_CHARS}]{{1,3}}\s*\d+$")
@@ -146,6 +150,7 @@ def _parse_toc_lines(
             t = item["text"]
 
             is_standalone = bool(digit_pat.match(t) or roman_pat.match(t))
+            is_roman_arabic = bool(roman_arabic_pat.match(t))
             is_trailed = bool(trailed_pat.match(t)) if not is_standalone else False
             is_paren = (
                 bool(paren_digit_pat.match(t))
@@ -166,6 +171,7 @@ def _parse_toc_lines(
 
             if (
                 not is_standalone
+                and not is_roman_arabic
                 and not is_trailed
                 and not is_paren
                 and not is_dot_leader
@@ -192,6 +198,10 @@ def _parse_toc_lines(
                     title_end = i
             elif t.isdigit():
                 page_num = int(t)
+                title_end = i
+            elif is_roman_arabic:
+                # "I-1" — keep as string; the page map converts it
+                page_num = t.upper()
                 title_end = i
             else:
                 page_num = t.upper()

@@ -11,12 +11,15 @@ from paddleocr import LayoutDetection, PaddleOCR
 
 from .llm import build_toc_llm, build_toc_vllm
 from .ocr_engine import (
+    compute_page_offset,
     detect_toc_pages_by_continuity,
     detect_toc_pages_by_keyword,
-    get_page_offset2,
+    get_number_box_pages,
     get_toc_pages,
     keep_longest_contiguous_pages,
+    ocr_number_boxes,
 )
+from .page_map import build_page_map, detect_roman_arabic_format, map_page_num
 from .parsing import inherit_page_numbers, reconstruct_toc1, repair_toc_tree
 from .utils import (
     # _roman_to_int,
@@ -75,14 +78,23 @@ def add_bookmarks_to_pdf(
     toc_tree: list[dict],
     page_offset: int,
     output_path: str,
+    page_map: dict[str, int] | None = None,
 ) -> None:
-    """Add PDF outline (bookmarks) from a TOC tree using printed-page -> PDF index mapping."""
+    """Add PDF outline (bookmarks) from a TOC tree using printed-page -> PDF index mapping.
+
+    ``page_map`` (from :mod:`toc_forge.page_map`) converts "X-n" page
+    numbers (Roman chapter + within-chapter Arabic, e.g. "I-2") to
+    cumulative Arabic page numbers before applying the offset.
+    """
 
     def _page_num_to_pdf(page_num: int | str | None) -> int:
         """Map a printed page number to a 1-based PDF page number (pymupdf convention)."""
         if isinstance(page_num, int):
             return page_num + page_offset + 1
         if isinstance(page_num, str):
+            mapped = map_page_num(page_map, page_num)
+            if mapped is not None:
+                return mapped + page_offset + 1
             try:
                 return int(page_num) + page_offset + 1
             except ValueError:
@@ -309,8 +321,11 @@ def bookmark_pdf(
 
     # 页码偏移：直接用布局检测的 number box 位置截取小图 + PaddleOCR 扫描
     # （get_page_offset2），不再调用 PPStructureV3（加载子模型多、耗时长）。
-    page_offset = get_page_offset2(
-        number_pages,
+    # 这里显式走三阶段而不是 get_page_offset2 wrapper，是为了拿到 number OCR
+    # 结果做罗马页码格式检测（detect_roman_arabic_format）。
+    kept_pages = get_number_box_pages(number_pages, page_imgs)
+    number_ocr_results = ocr_number_boxes(
+        kept_pages,
         page_imgs,
         ocr_model,
         do_debug=do_debug,
@@ -318,7 +333,30 @@ def bookmark_pdf(
         cache_dir=cache_dir,
         pdf_hash=pdf_hash,
     )
+    page_offset = compute_page_offset(number_ocr_results)
     logger.debug(f"page_offset: {page_offset}")
+
+    # 罗马数字页码映射：正文页码为 "I-1"、"II-1"（罗马章号-章内阿拉伯页码）
+    # 形式的书（如 Morin 力学），先检测格式，再把每章页码映射成累计阿拉伯
+    # 页码，加书签时用映射后的页码计算偏移。
+    page_map = None
+    if detect_roman_arabic_format(number_ocr_results):
+        start_page = max((p["page"] for p in toc_pages), default=-1) + 1
+        page_map = build_page_map(
+            doc,
+            start_page,
+            doc.page_count,
+            ocr_model,
+            number_pages,
+            page_imgs,
+            cache_dir=cache_dir,
+            pdf_hash=pdf_hash,
+        )
+        logger.info(
+            f"roman page map: {len(page_map)} entries"
+            if page_map
+            else "roman page map: format detected but no entries found"
+        )
 
     # OCR 模型用完即释放（onnxruntime 的 CUDA arena 显存不自动归还）
     del ocr_model
@@ -328,7 +366,9 @@ def bookmark_pdf(
     if not os.path.exists(output):
         os.makedirs(output)
     pdf_bookmarks_path = os.path.join(output, f"{Path(input).stem}_bookmarked.pdf")
-    add_bookmarks_to_pdf(doc, toc_tree1, page_offset, pdf_bookmarks_path)
+    add_bookmarks_to_pdf(
+        doc, toc_tree1, page_offset, pdf_bookmarks_path, page_map=page_map
+    )
 
     def update_page_offset(toc_tree1, page_offset):
         for item in toc_tree1:
