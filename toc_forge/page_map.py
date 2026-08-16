@@ -14,12 +14,14 @@ applying the PDF offset.
 
 import logging
 import re
+import statistics
 from collections import defaultdict
 
 from .utils import (
     _cache_load,
     _cache_path,
     _cache_save,
+    _roman_to_int,
     image_from_page,
 )
 
@@ -320,6 +322,90 @@ def build_page_map(
         f"(anchor p{anchor_idx}, scanned p{start_page}-{idx})"
     )
     return page_map
+
+
+def _ocr_front_matter_page_numbers(
+    doc,
+    page_idx: int,
+    ocr_model,
+    cache_dir: str | None,
+    pdf_hash: str | None,
+) -> list[str]:
+    """OCR the front-matter page-number crops of one page.
+
+    Front-matter page numbers sit at positions that differ from body-page
+    numbers (e.g. Kibble: even pages top-left, odd pages bottom-center),
+    which is why the layout number-box flow drops them.  Crop the top
+    corners and the bottom-center band and OCR each.
+    """
+    cache_path = (
+        _cache_path(cache_dir, pdf_hash, "front_matter_ocr", page_idx)
+        if cache_dir and pdf_hash
+        else None
+    )
+    cached = _cache_load(cache_path) if cache_path else None
+    if cached is not None:
+        return cached["texts"]
+
+    img = image_from_page(doc[page_idx])
+    h, w = img.shape[:2]
+    crops = [
+        (0.0, 0.0, 0.35 * w, 0.12 * h),      # 顶部左角
+        (0.65 * w, 0.0, w, 0.12 * h),        # 顶部右角
+        (0.25 * w, 0.85 * h, 0.75 * w, h),   # 底部中央
+    ]
+    texts = []
+    for x1, y1, x2, y2 in crops:
+        crop = img[int(y1) : int(y2), int(x1) : int(x2)]
+        if crop.size == 0:
+            texts.append("")
+            continue
+        result = ocr_model.predict(crop)[0]
+        texts.append("".join(result["rec_texts"]))
+    if cache_path:
+        _cache_save(cache_path, {"texts": texts})
+    return texts
+
+
+def build_front_matter_offset(
+    doc,
+    start_page: int,
+    end_page: int,
+    ocr_model,
+    cache_dir: str | None = None,
+    pdf_hash: str | None = None,
+) -> int | None:
+    """Compute the PDF-to-printed offset for front matter pages that number
+    themselves with Roman numerals ("vii").
+
+    Front matter numbering is a separate system from the Arabic body pages:
+    in Kibble's "Classical Mechanics" the body offset is 20 while front
+    matter prints "vii" on PDF page 7 (offset 0).  Scans pages in
+    [start_page, end_page) — the TOC end to the first body page (printed
+    page 1 sits at ``page_offset + 1``) — OCR'ing the front-matter number
+    positions, and returns the median of (pdf_idx - printed).  Returns None
+    when no front-matter page number is found.  Per-page OCR is cached under
+    the "front_matter_ocr" stage.
+    """
+    offsets = []
+    end = min(end_page, doc.page_count)
+    for idx in range(start_page, end):
+        for t in _ocr_front_matter_page_numbers(
+            doc, idx, ocr_model, cache_dir, pdf_hash
+        ):
+            t = t.strip()
+            if not t:
+                continue
+            r = _roman_to_int(t)
+            if r is not None and r > 0:
+                offsets.append(idx - r)
+                break
+            if re.fullmatch(r"\d{1,3}", t):
+                offsets.append(idx - int(t))
+                break
+    if not offsets:
+        return None
+    return int(statistics.median(offsets))
 
 
 def map_page_num(page_map: dict[str, int] | None, page_num) -> int | None:

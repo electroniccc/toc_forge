@@ -3,6 +3,8 @@
 import gc
 import logging
 import os
+import re
+import statistics
 import time
 from pathlib import Path
 
@@ -19,10 +21,15 @@ from .ocr_engine import (
     keep_longest_contiguous_pages,
     ocr_number_boxes,
 )
-from .page_map import build_page_map, detect_roman_arabic_format, map_page_num
+from .page_map import (
+    build_front_matter_offset,
+    build_page_map,
+    detect_roman_arabic_format,
+    map_page_num,
+)
 from .parsing import inherit_page_numbers, reconstruct_toc1, repair_toc_tree
 from .utils import (
-    # _roman_to_int,
+    _roman_to_int,
     compute_file_hash,
     image_from_page,
     make_sure_model_exists,
@@ -79,12 +86,16 @@ def add_bookmarks_to_pdf(
     page_offset: int,
     output_path: str,
     page_map: dict[str, int] | None = None,
+    front_offset: int | None = None,
 ) -> None:
     """Add PDF outline (bookmarks) from a TOC tree using printed-page -> PDF index mapping.
 
     ``page_map`` (from :mod:`toc_forge.page_map`) converts "X-n" page
     numbers (Roman chapter + within-chapter Arabic, e.g. "I-2") to
     cumulative Arabic page numbers before applying the offset.
+    ``front_offset`` maps front-matter pages that use Roman numerals
+    ("vii") — their numbering is a separate system from the Arabic body
+    pages, so they need their own offset.
     """
 
     def _page_num_to_pdf(page_num: int | str | None) -> int:
@@ -98,6 +109,11 @@ def add_bookmarks_to_pdf(
             try:
                 return int(page_num) + page_offset + 1
             except ValueError:
+                # front matter often uses lowercase Roman numerals ("vii")
+                r = _roman_to_int(page_num)
+                if r is not None:
+                    base = front_offset if front_offset is not None else page_offset
+                    return r + base + 1
                 return 1
         return 1
 
@@ -335,6 +351,32 @@ def bookmark_pdf(
     )
     page_offset = compute_page_offset(number_ocr_results)
     logger.debug(f"page_offset: {page_offset}")
+    # front matter 偏移：有的书 front matter 用罗马页码（"vii"）、正文用阿拉伯
+    # 数字（1, 2, ...），两套体系 offset 不同（如 Kibble：正文 offset 20，
+    # front matter offset 0）。目录树里存在罗马字符串页码时，扫描目录后到
+    # 正文起始（印刷 1 所在页 = page_offset + 1）之间的 front matter 页码。
+    front_offset = None
+
+    def _has_roman_page(nodes: list[dict]) -> bool:
+        for n in nodes:
+            pn = n.get("page_num")
+            if isinstance(pn, str) and _roman_to_int(pn) is not None:
+                return True
+            if _has_roman_page(n.get("children", [])):
+                return True
+        return False
+
+    if _has_roman_page(toc_tree1):
+        toc_end = max((p["page"] for p in toc_pages), default=-1)
+        front_offset = build_front_matter_offset(
+            doc,
+            toc_end + 1,
+            page_offset + 1,
+            ocr_model,
+            cache_dir=cache_dir,
+            pdf_hash=pdf_hash,
+        )
+        logger.debug(f"front matter offset: {front_offset}")
 
     # 罗马数字页码映射：正文页码为 "I-1"、"II-1"（罗马章号-章内阿拉伯页码）
     # 形式的书（如 Morin 力学），先检测格式，再把每章页码映射成累计阿拉伯
@@ -367,7 +409,12 @@ def bookmark_pdf(
         os.makedirs(output)
     pdf_bookmarks_path = os.path.join(output, f"{Path(input).stem}_bookmarked.pdf")
     add_bookmarks_to_pdf(
-        doc, toc_tree1, page_offset, pdf_bookmarks_path, page_map=page_map
+        doc,
+        toc_tree1,
+        page_offset,
+        pdf_bookmarks_path,
+        page_map=page_map,
+        front_offset=front_offset,
     )
 
     def update_page_offset(toc_tree1, page_offset):

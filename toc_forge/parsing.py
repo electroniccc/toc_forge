@@ -11,6 +11,30 @@ from .utils import _section_sort_key
 
 logger = logging.getLogger(__name__)
 
+# English chapter-like title patterns (used by _merge_page_trees' chapter
+# detection and by the level floors in _assign_levels).  Covers "1.
+# Introduction" (Kibble style), "1 Introduction" (OpenStax/Morin style),
+# "Chapter 1", "Part I", "A Table of Integrals", and the front/back-matter
+# words (Preface, Appendix, ...).
+_EN_CHAPTER_PAT = re.compile(
+    r"^\d+\.\s+[A-Z]"  # "1. Introduction"
+    r"|^\d+\s+[A-Z]"  # "1 Introduction"
+    r"|^Chapter\s+\d+"
+    r"|^Part\s+[IVX\d]+"
+    r"|^(Preface|Introduction|Appendix|Index|Bibliography|References|Answer Key|Errata)(\s|$)"
+    r"|^[A-Z]\s"
+)
+# number-led subset used as a level-0 floor.  The front/back-matter words are
+# excluded on purpose: OpenStax's "Introduction 7" is a per-chapter subheading
+# that must stay nested, not a root entry.
+_EN_CHAPTER_FLOOR = re.compile(
+    r"^\d+\.\s+[A-Z]"
+    r"|^\d+\s+[A-Z]"
+    r"|^Chapter\s+\d+"
+    r"|^Part\s+[IVX\d]+"
+    r"|^[A-Z]\s"
+)
+
 
 def _parse_toc_lines(
     toc_results: list[dict],
@@ -225,7 +249,7 @@ def _parse_toc_lines(
                 # "I-1" — keep as string; the page map converts it
                 page_num = t.upper()
                 title_end = i
-            elif use_trailing_num and is_rightmost:
+            elif use_trailing_num and is_rightmost and re.search(r"\d", t):
                 # English TOCs: page number in the same fragment as the title,
                 # space-separated ("Preface 1", "1.1 Review of Functions 8") or
                 # glued ("The Limit Laws140")
@@ -339,15 +363,8 @@ def _merge_page_trees(
     ch_pat = re.compile(r"^第[一二三四五六七八九十\d]+(?:章(?!习题)|篇)")
     sec_pat = re.compile(r"^第[一二三四五六七八九十\d]+节")
     back_pat = re.compile(r"^附录|^参考书目|^参考文献|^名词索引|^索引|^学时分配")
-    # English chapter-like titles: "1 Functions and Graphs", "Chapter 1",
-    # "Part I", "A Table of Integrals", "Preface", "Answer Key", ...
-    en_ch_like = re.compile(
-        r"^\d+\s+[A-Z]"
-        r"|^Chapter\s+\d+"
-        r"|^Part\s+[IVX\d]+"
-        r"|^(Preface|Introduction|Appendix|Index|Bibliography|References|Answer Key|Errata)(\s|$)"
-        r"|^[A-Z]\s"
-    )
+    # English chapter-like titles come from the module-level _EN_CHAPTER_PAT
+    # (used below in _is_chapter_like)
 
     _cn_num = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
                "八": 8, "九": 9, "十": 10}
@@ -360,7 +377,7 @@ def _merge_page_trees(
         return (
             ch_pat.match(node["title"]) is not None
             or back_pat.match(node["title"]) is not None
-            or en_ch_like.match(node["title"]) is not None
+            or _EN_CHAPTER_PAT.match(node["title"]) is not None
         )
 
     def _find_section_child(children: list[dict], sec_num: int) -> dict | None:
@@ -399,6 +416,7 @@ def _merge_page_trees(
                 or re.match(r"^[一二三四五六七八九十]、|^习题\s*\d+", node["title"])
                 or re.match(r"^\d+\s*\S", node["title"])      # "1 Title"
                 or re.match(r"^小结$|^习题$", node["title"])   # standalone
+                or re.match(r"^[A-Z]\.\d", node["title"])     # "A.2" appendix section
                 or re.match(
                     r"^Chapter Review|^Key Terms|^Key Equations|"
                     r"^Review Exercises|^Chapter Exercises",
@@ -642,6 +660,8 @@ def reconstruct_toc1(
         r"^[一二三四五六七八九十]、"             # 一、二、三、
         r"|^\d+\.\d+"                            # 1.1  1.2
     )
+    # 字母编号节（附录子节）："A.2 The Scalar Product"
+    _alpha_sec_pat = re.compile(r"^[A-Z]\.\d")
 
     def _assign_levels(plist: list[dict]) -> None:
         """Assign indentation levels via gap-tree + paragraph_title depth.
@@ -708,8 +728,17 @@ def reconstruct_toc1(
                 p["level"] = 0
             elif back_pat.match(t):
                 p["level"] = 0
+            # 编号型英文章节（"1 Introduction"、"1. Introduction"、
+            # "Chapter 1"、"A Table of Integrals"）：level 0 floor —— 否则
+            # "1. Introduction" 会被 "^\d+\s*\S" section floor 抬到 level 1，
+            # 嵌套进 List of Symbols 之类的 front matter 条目
+            elif _EN_CHAPTER_FLOOR.match(t):
+                p["level"] = 0
             # Section-like: at least level 1
             elif _sec_floor_pat.match(t) and p["level"] < 1:
+                p["level"] = 1
+            elif _alpha_sec_pat.match(t) and p["level"] < 1:
+                # 字母编号节："A.2 The Scalar Product"（附录子节）
                 p["level"] = 1
             # Subsection-like: at least level 2
             elif _sub_floor_pat.match(t) and p["level"] < 2:
@@ -728,7 +757,7 @@ def reconstruct_toc1(
                     if p.get("cb_label") == "paragraph_title":
                         continue
                     # never override a chapter / back-matter assignment
-                    if ch_pat.match(t) or back_pat.match(t):
+                    if ch_pat.match(t) or back_pat.match(t) or _EN_CHAPTER_FLOOR.match(t):
                         continue
                     new_level = 1 if int(lb) == right_label else 0
                     # respect semantic floors
@@ -969,8 +998,10 @@ def inherit_page_numbers(
         return None
 
     def _fix_node(node: dict, siblings: list[dict], idx: int) -> None:
+        # 只对缺失（None）页码继承：字符串页码（"VII"、"I-1"）是有意义的
+        # 页码（front matter 罗马数字 / 罗马-数字映射），继承 int 会覆盖掉
         pn = node.get("page_num")
-        if pn is None or not isinstance(pn, int):
+        if pn is None:
             inherited = _first_child_page(node, max_depth)
             if inherited is None and siblings:
                 for sib in siblings[idx + 1 :]:
