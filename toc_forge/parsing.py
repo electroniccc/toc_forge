@@ -7,9 +7,29 @@ from collections import defaultdict
 import numpy as np
 from sklearn.cluster import KMeans
 
-from .utils import _section_sort_key
+from .utils import _roman_to_int, _section_sort_key
 
 logger = logging.getLogger(__name__)
+
+
+def _page_num_sort_key(page_num) -> int:
+    """Numerical sort key for a page number.
+
+    Page numbers may be int, None, or strings ("VII", "I-1") from the
+    Roman-numeral front-matter / chapter-page parsing — a bare
+    ``page_num or 99999`` would compare str with int and crash.
+    """
+    if isinstance(page_num, int):
+        return page_num
+    if isinstance(page_num, str):
+        r = _roman_to_int(page_num)
+        if r is not None:
+            return r
+        m = re.search(r"\d+", page_num)
+        if m:
+            return int(m.group())
+    return 99999
+
 
 # English chapter-like title patterns (used by _merge_page_trees' chapter
 # detection and by the level floors in _assign_levels).  Covers "1.
@@ -448,7 +468,7 @@ def _merge_page_trees(
                     if target["children"]:
                         target["children"].sort(
                             key=lambda c: (
-                                c.get("page_num") or 99999,
+                                _page_num_sort_key(c.get("page_num")),
                                 _section_sort_key(c["title"]),
                             )
                         )
@@ -874,7 +894,7 @@ def repair_toc_tree(tree: list[dict]) -> list[dict]:
             if ch.get("children"):
                 ch["children"].sort(
                     key=lambda c: (
-                        c.get("page_num") or 99999,
+                        _page_num_sort_key(c.get("page_num")),
                         _section_sort_key(c["title"]),
                     )
                 )
@@ -924,19 +944,19 @@ def repair_toc_tree(tree: list[dict]) -> list[dict]:
             if sec.get("children"):
                 sec["children"].sort(
                     key=lambda c: (
-                        c.get("page_num") or 99999,
+                        _page_num_sort_key(c.get("page_num")),
                         _section_sort_key(c["title"]),
                     )
                 )
 
         result = sorted(
             sections,
-            key=lambda c: (c.get("page_num") or 99999, _section_sort_key(c["title"])),
+            key=lambda c: (_page_num_sort_key(c.get("page_num")), _section_sort_key(c["title"])),
         )
         result.extend(
             sorted(
                 keep,
-                key=lambda c: (c.get("page_num") or 99999, _section_sort_key(c["title"])),
+                key=lambda c: (_page_num_sort_key(c.get("page_num")), _section_sort_key(c["title"])),
             )
         )
         return result
@@ -966,7 +986,7 @@ def repair_toc_tree(tree: list[dict]) -> list[dict]:
                 node["children"] = _fix_chapter_children(node["children"])
             node["children"].sort(
                 key=lambda c: (
-                    c.get("page_num") or 99999,
+                    _page_num_sort_key(c.get("page_num")),
                     _section_sort_key(c["title"]),
                 )
             )
