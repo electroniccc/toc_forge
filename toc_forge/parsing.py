@@ -125,6 +125,15 @@ def _parse_toc_lines(
         len(rightmost_items), 1
     )
     use_paren_mode = paren_ratio > 0.5
+    # English TOCs often print "Title 8" with the page number in the same OCR
+    # fragment as the title (no dot leader), e.g. "Preface 1", or glued:
+    # "The Limit Laws140".  When most rightmost fragments on the page end in
+    # a 1-3 digit number, enable splitting the trailing number off as the
+    # page number.
+    trailing_ratio = sum(
+        1 for t in rightmost_items if re.search(r"\d{1,3}$", t)
+    ) / max(len(rightmost_items), 1)
+    use_trailing_num = trailing_ratio > 0.5
 
     parsed = []
     for line in lines:
@@ -148,13 +157,18 @@ def _parse_toc_lines(
         for i in range(len(line) - 1, -1, -1):
             item = line[i]
             t = item["text"]
+            # 页码只可能在行内最右片段：行首的独立数字（如 "1 Functions and
+            # Graphs 7" 里的 "1"）是章节编号，不是页码
+            is_rightmost = i == len(line) - 1
 
-            is_standalone = bool(digit_pat.match(t) or roman_pat.match(t))
-            is_roman_arabic = bool(roman_arabic_pat.match(t))
+            is_standalone = is_rightmost and bool(
+                digit_pat.match(t) or roman_pat.match(t)
+            )
+            is_roman_arabic = is_rightmost and bool(roman_arabic_pat.match(t))
             is_trailed = bool(trailed_pat.match(t)) if not is_standalone else False
             is_paren = (
                 bool(paren_digit_pat.match(t))
-                if use_paren_mode and not is_standalone
+                if use_paren_mode and is_rightmost and not is_standalone
                 else False
             )
             dot_m = (
@@ -175,9 +189,17 @@ def _parse_toc_lines(
                 and not is_trailed
                 and not is_paren
                 and not is_dot_leader
+                and not (use_trailing_num and is_rightmost)
             ):
                 continue
-            if i > 0 and is_dot_leader is False:
+            # gap 检查拦"紧贴标题的数字"（如 "Chapter 1"）；但 trailing_num
+            # 模式下右端数字大多是页码，且 OpenStax 类目录的页码 OCR 框常与
+            # 标题框 x 重叠（"Limits" 与 "105"），此时不拦
+            if (
+                i > 0
+                and is_dot_leader is False
+                and not (use_trailing_num and is_rightmost)
+            ):
                 prev = line[i - 1]
                 gap = item["xmin"] - prev["xmax"]
                 if gap < max(item["height"] * 0.25, 5.0):
@@ -203,6 +225,21 @@ def _parse_toc_lines(
                 # "I-1" — keep as string; the page map converts it
                 page_num = t.upper()
                 title_end = i
+            elif use_trailing_num and is_rightmost:
+                # English TOCs: page number in the same fragment as the title,
+                # space-separated ("Preface 1", "1.1 Review of Functions 8") or
+                # glued ("The Limit Laws140")
+                m = re.match(r"^(.*[^\d\s])\s+(\d{1,3})$", t)
+                if not m:
+                    # glued digits: the title part must end in a letter /
+                    # CJK char so pure numbering like "1.1" is not split
+                    m = re.match(r"^(.+?[A-Za-z一-鿿])(\d{1,3})$", t)
+                if m:
+                    line[i]["text"] = m.group(1)
+                    page_num = int(m.group(2))
+                    title_end = i + 1
+                else:
+                    continue
             else:
                 page_num = t.upper()
                 title_end = i
@@ -302,6 +339,15 @@ def _merge_page_trees(
     ch_pat = re.compile(r"^第[一二三四五六七八九十\d]+(?:章(?!习题)|篇)")
     sec_pat = re.compile(r"^第[一二三四五六七八九十\d]+节")
     back_pat = re.compile(r"^附录|^参考书目|^参考文献|^名词索引|^索引|^学时分配")
+    # English chapter-like titles: "1 Functions and Graphs", "Chapter 1",
+    # "Part I", "A Table of Integrals", "Preface", "Answer Key", ...
+    en_ch_like = re.compile(
+        r"^\d+\s+[A-Z]"
+        r"|^Chapter\s+\d+"
+        r"|^Part\s+[IVX\d]+"
+        r"|^(Preface|Introduction|Appendix|Index|Bibliography|References|Answer Key|Errata)(\s|$)"
+        r"|^[A-Z]\s"
+    )
 
     _cn_num = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7,
                "八": 8, "九": 9, "十": 10}
@@ -309,10 +355,12 @@ def _merge_page_trees(
     _sec_num_pat = re.compile(r"^第([一二三四五六七八九十\d]+)节")
 
     def _is_chapter_like(node: dict) -> bool:
-        """Entry that looks like a top-level chapter."""
+        """Entry that looks like a top-level chapter (Chinese 第X章/第X篇,
+        or an English numbered/headed chapter entry)."""
         return (
             ch_pat.match(node["title"]) is not None
             or back_pat.match(node["title"]) is not None
+            or en_ch_like.match(node["title"]) is not None
         )
 
     def _find_section_child(children: list[dict], sec_num: int) -> dict | None:
@@ -351,6 +399,11 @@ def _merge_page_trees(
                 or re.match(r"^[一二三四五六七八九十]、|^习题\s*\d+", node["title"])
                 or re.match(r"^\d+\s*\S", node["title"])      # "1 Title"
                 or re.match(r"^小结$|^习题$", node["title"])   # standalone
+                or re.match(
+                    r"^Chapter Review|^Key Terms|^Key Equations|"
+                    r"^Review Exercises|^Chapter Exercises",
+                    node["title"],
+                )  # English per-chapter back matter
             )
             is_section_like = not _is_chapter_like(node) and sec_pattern
 
