@@ -3,7 +3,7 @@
 import io
 import sys
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # 打包为无控制台窗口的程序（--noconsole）时，sys.stdout/stderr 是 None，
 # 此时 print() 和 reconfigure() 都会抛 AttributeError。

@@ -1,12 +1,13 @@
 """TOC Forge — desktop GUI."""
 import locale
 import os
+import re
 import subprocess
 import threading
 import tkinter as tk
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import requests
 
@@ -95,6 +96,12 @@ _T = {
         "model_name": "Model name",
         "file_pdf": "PDF files",
         "file_all": "All files",
+        "toc_detect_max_page": "Max TOC scan pages",
+        "advanced_settings_collapsed": "▶ Advanced settings",
+        "advanced_settings_expanded": "▼ Advanced settings",
+        "update_title": "Update available",
+        "update_message": "A new version {version} has been released. "
+        "You can download it from the GitHub releases page.",
     },
     "zh": {
         "title": "TOC Forge",
@@ -135,12 +142,95 @@ _T = {
         "dl_ready": "{name} 已就位",
         "file_pdf": "PDF 文件",
         "file_all": "所有文件",
+        "toc_detect_max_page": "目录最大探测页数",
+        "advanced_settings_collapsed": "▶ 高级设置",
+        "advanced_settings_expanded": "▼ 高级设置",
+        "update_title": "发现新版本",
+        "update_message": "有新版本 {version} 已发布，可从 GitHub Releases 页面下载更新。",
     },
 }
 
 
 def t(key: str, **kwargs: object) -> str:
     return _T[_LANG].get(key, _T["en"].get(key, key)).format(**kwargs)  # type: ignore[arg-type]
+
+
+def _app_version() -> str:
+    """窗口标题用的版本号。
+
+    直接解析 ``toc_forge/__init__.py`` 里的 ``__version__``：不触发包导入
+    （也就不会在主线程拉起 paddleocr/paddle 原生库，窗口能立刻显示），且
+    永远是源码中的真实版本（与打包脚本读同一处；editable 安装的 dist-info
+    metadata 可能过期，importlib.metadata 不可靠）。PyInstaller
+    ``--collect-all=toc_forge`` 会把该源码文件一并打进包。
+    """
+    import os
+    import re
+
+    try:
+        pkg_init = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "toc_forge", "__init__.py"
+        )
+        with open(pkg_init, encoding="utf-8") as f:
+            m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', f.read())
+            return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+def _window_title() -> str:
+    ver = _app_version()
+    return f"{t('title')} v{ver}" if ver else t("title")
+
+
+# ---------------------------------------------------------------------------
+#  startup update check (GitHub releases)
+# ---------------------------------------------------------------------------
+
+# 本项目 GitHub 仓库（owner/name），启动时用它查询最新 release
+_GITHUB_REPO = "electroniccc/toc_forge"
+
+
+def _version_tuple(version: str) -> tuple:
+    """把 "v0.3.0" / "0.3.1" 解析成可比较的整数元组，如 (0, 3, 0)。
+
+    预发布后缀（如 "0.3.1-rc1"）只取数字前缀；无法解析的段按 0 处理；
+    不足 3 段时补 0（否则 "garbage" -> (0,) 与 (0,3,0) 首段相等会误判方向）。
+    """
+    out = []
+    for part in str(version).strip().lstrip("vV").split("."):
+        m = re.match(r"\d+", part)
+        out.append(int(m.group(0)) if m else 0)
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out)
+
+
+def _latest_release_tag() -> str | None:
+    """查询 GitHub 最新 release 的 tag_name；版本不高于当前则返回 None。
+
+    网络失败 / 非 200 / JSON 无 tag_name 一律返回 None —— 启动检查是
+    静默的（例如连不上 GitHub 时用户看不到任何报错或提示）。
+    """
+    try:
+        resp = requests.get(
+            f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest",
+            timeout=8,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "toc-forge",
+            },
+        )
+        if resp.status_code != 200:
+            return None
+        tag = str(resp.json().get("tag_name", "")).strip()
+        if not tag:
+            return None
+        if _version_tuple(tag) <= _version_tuple(_app_version()):
+            return None
+        return tag
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +326,7 @@ def _save_settings(settings: dict) -> None:
 class TocForgeApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title(t("title"))
+        root.title(_window_title())
         root.geometry("620x560")
         root.minsize(520, 460)
 
@@ -249,6 +339,8 @@ class TocForgeApp:
 
         if not all_models_exist(self.model_dir_var.get()):
             root.after(300, self._expand_model_section)
+        # 启动时静默检查 GitHub 新版本（后台线程，延迟等窗口先渲染出来）
+        root.after(1500, self._check_for_update)
 
     # ------------------------------------------------------------------
     #  UI construction
@@ -335,6 +427,27 @@ class TocForgeApp:
         ttk.Entry(out_row, textvariable=self.output_dir_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(out_row, text=t("browse"), command=self._browse_output).pack(side=tk.RIGHT, padx=(8, 0))
 
+        # --- advanced settings (collapsible) ---
+        # 默认折叠：只有一个"高级设置"按钮（靠左，不占满整行）；
+        # 点击展开"目录最大探测页数"输入框
+        self.adv_btn = ttk.Button(
+            path_frame, text=t("advanced_settings_collapsed"),
+            command=self._toggle_advanced,
+        )
+        self.adv_btn.pack(anchor=tk.W, pady=(8, 0))
+
+        self.toc_row = ttk.Frame(path_frame)  # 默认不 pack（折叠）
+        ttk.Label(self.toc_row, text=t("toc_detect_max_page"), width=14).pack(side=tk.LEFT)
+        # 目录页扫描一批 25 页，发现目录页后批大小降为 10，直到连续 3 页非目录
+        # 页；上限即此值（还会被总页数截断）。默认填 75：Spinbox 的加减按钮在
+        # 空值时会把值直接设成 from_（1），预填默认值避免误触。
+        self.toc_max_page_var = tk.StringVar(value="75")
+        ttk.Spinbox(
+            self.toc_row, textvariable=self.toc_max_page_var,
+            from_=1, to=9999, width=8,
+        ).pack(side=tk.LEFT)
+        self._advanced_visible = False
+
         # --- model section ---
         self.model_frame = ttk.LabelFrame(main, text=t("model_group"), padding="12 8 12 12")
 
@@ -407,6 +520,8 @@ class TocForgeApp:
         self.api_url_var.set(s.get("api_url", ""))
         self.api_key_var.set(s.get("api_key", ""))
         self.model_name_var.set(s.get("model_name", ""))
+        # 空串 / 缺失都回退到默认 75（旧设置可能存过 ""）
+        self.toc_max_page_var.set(str(s.get("toc_detect_max_page") or "75"))
         self._on_strategy_change()
         self._update_model_status()
 
@@ -420,6 +535,7 @@ class TocForgeApp:
             api_url=self.api_url_var.get(),
             api_key=self.api_key_var.get(),
             model_name=self.model_name_var.get(),
+            toc_detect_max_page=self.toc_max_page_var.get().strip(),
         )
         _save_settings(self.settings)
 
@@ -486,6 +602,31 @@ class TocForgeApp:
     def _toggle_key_visibility(self) -> None:
         self._key_visible = not self._key_visible
         self.api_key_entry.configure(show="" if self._key_visible else "•")
+
+    def _toggle_advanced(self) -> None:
+        self._advanced_visible = not self._advanced_visible
+        if self._advanced_visible:
+            self.toc_row.pack(fill=tk.X, pady=(8, 0), after=self.adv_btn)
+            self.adv_btn.configure(text=t("advanced_settings_expanded"))
+        else:
+            self.toc_row.pack_forget()
+            self.adv_btn.configure(text=t("advanced_settings_collapsed"))
+
+    def _check_for_update(self) -> None:
+        """后台线程查询 GitHub 最新 release，有新版本则弹提示框。
+
+        网络失败 / 无新版本一律静默（_latest_release_tag 返回 None）。
+        """
+
+        def _work() -> None:
+            tag = _latest_release_tag()
+            if tag:
+                self.root.after(0, lambda: self._show_update_prompt(tag))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _show_update_prompt(self, tag: str) -> None:
+        messagebox.showinfo(t("update_title"), t("update_message", version=tag))
         self._draw_eye()
 
     def _on_strategy_change(self, *_args: object) -> None:
@@ -624,6 +765,17 @@ class TocForgeApp:
         api_base = self.api_url_var.get().strip().replace("\n", "").replace("\r", "") if strategy != "local_ocr" else None
         api_key = self.api_key_var.get().strip() if strategy != "local_ocr" else None
 
+        # 目录最大探测页数：空值或非法值 → None（bookmark_pdf 用默认 25*3=75）
+        toc_detect_max_page = None
+        raw_max = self.toc_max_page_var.get().strip()
+        if raw_max:
+            try:
+                toc_detect_max_page = int(raw_max)
+                if toc_detect_max_page < 1:
+                    toc_detect_max_page = None
+            except ValueError:
+                toc_detect_max_page = None
+
         self._running = True
         self._last_output_dir = ""
         self._switch_to_process_btn()
@@ -678,6 +830,7 @@ class TocForgeApp:
                             # 大幅缩短推理时间；精度略低，需要更高精度时改回 server
                             ocr_model_size="mobile",
                             engine="onnxruntime",
+                            toc_detect_max_page=toc_detect_max_page,
                             output_filename=output_name,
                         )
                     except Exception as exc:

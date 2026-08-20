@@ -17,9 +17,199 @@ from .utils import (
     _unwrap_legacy_cache,
     deduplicate_content_boxes,
     filter_toc_result,
+    image_from_page,
 )
 
 logger = logging.getLogger(__name__)
+
+# 目录页扫描的最大页数默认值：首批 25 页 × 3 批。可通过
+# bookmark_pdf(..., toc_detect_max_page=...) / CLI --toc_detect_max_page 覆盖，
+# 实际上限还会被总页数截断。
+DEFAULT_TOC_DETECT_MAX_PAGE = 25 * 3
+
+
+def layout_pages_in_range(
+    doc,
+    layout_model,
+    start: int,
+    end: int,
+    do_debug: bool = False,
+    output: str = "output",
+    cache_dir: str | None = None,
+    pdf_hash: str | None = None,
+) -> tuple[list, list]:
+    """Render pages ``[start, end)`` of *doc* and run layout detection on them.
+
+    Per-page results are cached under the "layout" stage (the same cache that
+    ``get_toc_pages`` uses), so pages already inferred by an earlier batch scan
+    are served from cache instead of being re-inferred.  Returns
+    ``(imgs, results)``, both aligned to ``[start, end)`` — ``imgs[i]`` /
+    ``results[i]`` correspond to page ``start + i``.
+    """
+    imgs = [image_from_page(doc[i]) for i in range(start, end)]
+    results: list = []
+    missing: list[int] = []
+    for i in range(start, end):
+        cache_path = (
+            _cache_path(cache_dir, pdf_hash, "layout", i)
+            if cache_dir and pdf_hash
+            else None
+        )
+        cached = _cache_load(cache_path) if cache_path else None
+        if cached is not None:
+            results.append(CachedResult(_unwrap_legacy_cache(cached)))
+        else:
+            results.append(None)
+            missing.append(i)
+    if missing:
+        missing_imgs = [imgs[i - start] for i in missing]
+        preds = layout_model.predict(missing_imgs, layout_nms=True)
+        for i, res in zip(missing, preds):
+            results[i - start] = res
+            if cache_dir and pdf_hash:
+                _cache_save(
+                    _cache_path(cache_dir, pdf_hash, "layout", i),
+                    _cacheable_dict(res),
+                )
+            if do_debug:
+                res.save_to_img(os.path.join(output, f"page_layout_{i}.png"))
+                res.save_to_json(os.path.join(output, f"page_layout_{i}.json"))
+    return imgs, results
+
+
+def extract_toc_and_number_pages(
+    results: list,
+    start: int = 0,
+) -> tuple[list[dict], list[dict], list[list[dict]]]:
+    """Derive TOC pages, number-box pages and the raw per-page boxes from
+    layout detection results.
+
+    ``start`` is the page index of ``results[0]`` (the results may cover only a
+    suffix of the document, e.g. the page-number sampling range).  A page is a
+    TOC page when it carries ``content`` boxes — with ``paragraph_title`` boxes
+    sitting above/between them merged in — and a number page when it carries
+    ``number`` boxes.
+    """
+    toc_pages = []
+    for res_i, res in enumerate(results):
+        page_idx = start + res_i
+        boxes = res["boxes"]
+        content_boxes = []
+        para_titles = []
+        for box in boxes:
+            if box["label"] == "content":
+                content_boxes.append(box)
+            elif box["label"] == "paragraph_title":
+                para_titles.append(box)
+        if content_boxes:
+            # Include paragraph_title boxes that sit between content boxes
+            # (or above the first one).  These are often "篇" / "章" headings
+            # that the layout model didn't label as "content".
+            sorted_cbs = sorted(content_boxes, key=lambda cb: cb["coordinate"][1])
+            prev_bottom = -20
+            for cb in sorted_cbs:
+                cb_top = cb["coordinate"][1]
+                between = [
+                    pt for pt in para_titles
+                    if pt["coordinate"][3] <= cb_top + 5
+                    and pt["coordinate"][1] >= prev_bottom - 5
+                ]
+                content_boxes.extend(between)
+                prev_bottom = cb["coordinate"][3]
+            content_boxes = deduplicate_content_boxes(content_boxes)
+            toc_pages.append({"page": page_idx, "content_boxes": content_boxes})
+    # pages that may carry printed page numbers
+    pages_with_number = []
+    for res_i, res in enumerate(results):
+        page_idx = start + res_i
+        boxes = res["boxes"]
+        content_boxes = []
+        for box in boxes:
+            if box["label"] == "number":
+                content_boxes.append(box)
+        if content_boxes:
+            content_boxes = deduplicate_content_boxes(content_boxes)
+            pages_with_number.append({"page": page_idx, "content_boxes": content_boxes})
+    all_boxes = [res["boxes"] for res in results]
+    return toc_pages, pages_with_number, all_boxes
+
+
+def scan_toc_page_range(
+    doc,
+    layout_model,
+    max_pages: int,
+    batch_size: int = 25,
+    found_batch_size: int = 10,
+    stop_after_non_toc: int = 3,
+    do_debug: bool = False,
+    output: str = "output",
+    cache_dir: str | None = None,
+    pdf_hash: str | None = None,
+) -> tuple[int, list[int]]:
+    """Scan pages in batches for TOC pages and return the scanned range.
+
+    Layout detection is the only signal used here — a page counts as a TOC
+    page when its layout result carries a ``content`` box.  The keyword /
+    continuity supplements (``detect_toc_pages_by_keyword`` /
+    ``detect_toc_pages_by_continuity``) run later over the returned range.
+
+    - Pages are scanned in batches of ``batch_size`` (25 by default), up to
+      ``max_pages`` (the caller caps it at the document length).
+    - Once a TOC page is seen in a batch, the batch size shrinks to
+      ``found_batch_size`` (10) and scanning continues until
+      ``stop_after_non_toc`` (3) consecutive non-TOC pages are seen.
+    - Per-page layout results are cached, so the subsequent
+      ``layout_pages_in_range`` pass over ``[0, scan_end)`` is a cache hit.
+
+    Returns ``(scan_end, toc_page_indices)``: the exclusive end of the scanned
+    range, and the page indices that carried a ``content`` box.
+    """
+    limit = min(max_pages, doc.page_count)
+    scan_end = 0
+    toc_indices: list[int] = []
+    consecutive_non_toc = 0
+    found = False
+    batch = batch_size
+    start = 0
+    while start < limit:
+        end = min(start + batch, limit)
+        _, results = layout_pages_in_range(
+            doc,
+            layout_model,
+            start,
+            end,
+            do_debug=do_debug,
+            output=output,
+            cache_dir=cache_dir,
+            pdf_hash=pdf_hash,
+        )
+        for i, res in zip(range(start, end), results):
+            has_content = any(b["label"] == "content" for b in res["boxes"])
+            if has_content:
+                toc_indices.append(i)
+                found = True
+                consecutive_non_toc = 0
+            elif found:
+                consecutive_non_toc += 1
+                if consecutive_non_toc >= stop_after_non_toc:
+                    scan_end = i + 1
+                    logger.debug(
+                        f"toc scan: stopped at p{scan_end} after "
+                        f"{stop_after_non_toc} consecutive non-TOC pages "
+                        f"(found {len(toc_indices)} content pages, "
+                        f"batch {batch_size}->{found_batch_size})"
+                    )
+                    return scan_end, toc_indices
+        scan_end = end
+        start = end
+        if found:
+            batch = found_batch_size
+    logger.debug(
+        f"toc scan: scanned {scan_end} pages in batches of {batch_size}"
+        f"{'->' + str(found_batch_size) if found else ''}, "
+        f"{len(toc_indices)} content pages (max_pages={limit})"
+    )
+    return scan_end, toc_indices
 
 
 def get_toc_pages(
@@ -58,44 +248,7 @@ def get_toc_pages(
             res.save_to_img(os.path.join(output, f"page_layout_{i}.png"))
             res.save_to_json(os.path.join(output, f"page_layout_{i}.json"))
 
-    toc_pages = []
-    for res_i, res in enumerate(results):
-        boxes = res["boxes"]
-        content_boxes = []
-        para_titles = []
-        for box in boxes:
-            if box["label"] == "content":
-                content_boxes.append(box)
-            elif box["label"] == "paragraph_title":
-                para_titles.append(box)
-        if content_boxes:
-            # Include paragraph_title boxes that sit between content boxes
-            # (or above the first one).  These are often "篇" / "章" headings
-            # that the layout model didn't label as "content".
-            sorted_cbs = sorted(content_boxes, key=lambda cb: cb["coordinate"][1])
-            prev_bottom = -20
-            for cb in sorted_cbs:
-                cb_top = cb["coordinate"][1]
-                between = [
-                    pt for pt in para_titles
-                    if pt["coordinate"][3] <= cb_top + 5
-                    and pt["coordinate"][1] >= prev_bottom - 5
-                ]
-                content_boxes.extend(between)
-                prev_bottom = cb["coordinate"][3]
-            content_boxes = deduplicate_content_boxes(content_boxes)
-            toc_pages.append({"page": res_i, "content_boxes": content_boxes})
-    # pages that may carry printed page numbers
-    pages_with_number = []
-    for res_i, res in enumerate(results):
-        boxes = res["boxes"]
-        content_boxes = []
-        for box in boxes:
-            if box["label"] == "number":
-                content_boxes.append(box)
-        if content_boxes:
-            content_boxes = deduplicate_content_boxes(content_boxes)
-            pages_with_number.append({"page": res_i, "content_boxes": content_boxes})
+    toc_pages, pages_with_number, all_boxes = extract_toc_and_number_pages(results)
     logger.debug(
         f"layout detection cost: {time.perf_counter() - t0:.2f}s "
         f"({len(imgs)} pages, {'cached' if cached_results is not None else 'inference'})"
@@ -103,7 +256,7 @@ def get_toc_pages(
     # third return: raw per-page boxes — the keyword supplement
     # (detect_toc_pages_by_keyword) needs them to find paragraph_title /
     # header boxes on pages the layout model did not flag as TOC pages
-    return toc_pages, pages_with_number, [res["boxes"] for res in results]
+    return toc_pages, pages_with_number, all_boxes
 
 
 def detect_toc_pages_by_keyword(

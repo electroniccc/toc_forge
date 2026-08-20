@@ -85,6 +85,13 @@ def main() -> None:
         help="OCR model size: 'server' (default, higher accuracy) or "
         "'mobile' (much faster on CPU, used by the GUI)",
     )
+    parser.add_argument(
+        "--toc_detect_max_page",
+        type=int,
+        default=None,
+        help="max pages to scan for TOC detection (default: 25*3=75; also "
+        "capped by the total page count)",
+    )
     parser.add_argument("--hash", action="store_true", help="print input file hash and exit")
     args = parser.parse_args()
 
@@ -136,6 +143,7 @@ def main() -> None:
             engine=args.engine,
             enable_mkldnn=False if args.disable_mkldnn else None,
             ocr_model_size=args.ocr_model_size,
+            toc_detect_max_page=args.toc_detect_max_page,
         )
     except TocForgeError as exc:
         print(f"toc-forge: {exc}", file=sys.stderr)

@@ -15,13 +15,16 @@ from paddleocr import LayoutDetection, PaddleOCR
 from .errors import EmptyTocError, TocNotFoundError
 from .llm import build_toc_llm, build_toc_vllm
 from .ocr_engine import (
+    DEFAULT_TOC_DETECT_MAX_PAGE,
     compute_page_offset,
     detect_toc_pages_by_continuity,
     detect_toc_pages_by_keyword,
+    extract_toc_and_number_pages,
     get_number_box_pages,
-    get_toc_pages,
     keep_longest_contiguous_pages,
+    layout_pages_in_range,
     ocr_number_boxes,
+    scan_toc_page_range,
 )
 from .page_map import (
     build_arabic_page_map,
@@ -41,7 +44,6 @@ from .parsing import (
 from .utils import (
     _roman_to_int,
     compute_file_hash,
-    image_from_page,
     make_sure_model_exists,
 )
 
@@ -212,16 +214,13 @@ def bookmark_pdf(
     engine: str | None = None,
     enable_mkldnn: bool | None = None,
     ocr_model_size: str = "server",
+    toc_detect_max_page: int | None = None,
     output_filename: str | None = None,
 ) -> tuple[str, float, dict]:
     start_time = time.perf_counter()
     pdf_hash = compute_file_hash(input) if cache_dir else None
     doc = pymupdf.open(input)
-    page_imgs = []
-    for i in range(min(50, doc.page_count)):
-        page = doc[i]
-        img = image_from_page(page)
-        page_imgs.append(img)
+
     layout_detection_model = "PP-DocLayout_plus-L"
     make_sure_model_exists(model_dir, layout_detection_model)
 
@@ -247,19 +246,33 @@ def bookmark_pdf(
         device=device,
         **_engine_kwargs,
     )
-    toc_pages, number_pages, all_boxes = get_toc_pages(
-        page_imgs,
+    # 目录页批量扫描：一次扫 25 页，最多扫 min(toc_detect_max_page, 总页数) 页；
+    # 某一批内看到目录页（布局 content 框）后批大小降为 10，直到连续 3 页非目录
+    # 页才停止。每页布局结果按页缓存，二次使用不重复推理。
+    max_pages = min(
+        toc_detect_max_page if toc_detect_max_page else DEFAULT_TOC_DETECT_MAX_PAGE,
+        doc.page_count,
+    )
+    scan_end, _scan_toc = scan_toc_page_range(
+        doc,
         layout_model,
+        max_pages,
         do_debug=do_debug,
         output=output,
         cache_dir=cache_dir,
         pdf_hash=pdf_hash,
     )
-    # 布局检测完成后布局模型不再需要，显式释放：onnxruntime 的 CUDA arena 对
-    # 动态 shape 会膨胀到数 GB 且不自动归还，与 OCR 模型的 session 叠加可撑爆
-    # 6GB 显存导致推理变慢；del + gc 后 onnxruntime session 销毁会归还显存。
-    del layout_model
-    gc.collect()
+    page_imgs, layout_results = layout_pages_in_range(
+        doc,
+        layout_model,
+        0,
+        scan_end,
+        do_debug=do_debug,
+        output=output,
+        cache_dir=cache_dir,
+        pdf_hash=pdf_hash,
+    )
+    toc_pages, number_pages, all_boxes = extract_toc_and_number_pages(layout_results)
     logger.debug(f"number_pages: {number_pages}")
 
     doc_ori_classify_model = "PP-LCNet_x1_0_doc_ori"
@@ -330,6 +343,39 @@ def bookmark_pdf(
     if not toc_pages:
         doc.close()
         raise TocNotFoundError("未检测到目录页")
+
+    # 页码取样页：找到目录页后，从最后一个目录页的位置再往后扫描 20 页作为页码
+    # 取样（布局 number box → 页码偏移计算）。取样区间可能超出目录扫描范围，
+    # 需要补渲染 + 布局检测，并把新页的 number box 追加进 number_pages。
+    # 因此布局模型比原先多存活一会儿（补扫完成后立即释放）。
+    last_toc_page = max((p["page"] for p in toc_pages), default=-1)
+    if last_toc_page >= 0:
+        sampling_end = min(last_toc_page + 20 + 1, doc.page_count)
+        if sampling_end > scan_end:
+            ext_imgs, ext_results = layout_pages_in_range(
+                doc,
+                layout_model,
+                scan_end,
+                sampling_end,
+                do_debug=do_debug,
+                output=output,
+                cache_dir=cache_dir,
+                pdf_hash=pdf_hash,
+            )
+            page_imgs.extend(ext_imgs)
+            _, ext_number_pages, _ = extract_toc_and_number_pages(
+                ext_results, start=scan_end
+            )
+            number_pages.extend(ext_number_pages)
+            logger.debug(
+                f"page-number sampling: extended layout scan to page "
+                f"{sampling_end - 1} (last TOC page {last_toc_page})"
+            )
+    # 布局检测完成后布局模型不再需要，显式释放：onnxruntime 的 CUDA arena 对
+    # 动态 shape 会膨胀到数 GB 且不自动归还，与 OCR 模型的 session 叠加可撑爆
+    # 6GB 显存导致推理变慢；del + gc 后 onnxruntime session 销毁会归还显存。
+    del layout_model
+    gc.collect()
 
     if toc_strategy == "vllm":
         toc_tree1 = build_toc_vllm(
