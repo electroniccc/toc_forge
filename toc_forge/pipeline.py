@@ -5,12 +5,14 @@ import logging
 import os
 import re
 import statistics
+import tempfile
 import time
 from pathlib import Path
 
 import pymupdf
 from paddleocr import LayoutDetection, PaddleOCR
 
+from .errors import EmptyTocError, TocNotFoundError
 from .llm import build_toc_llm, build_toc_vllm
 from .ocr_engine import (
     compute_page_offset,
@@ -30,7 +32,12 @@ from .page_map import (
     map_arabic_page,
     map_page_num,
 )
-from .parsing import inherit_page_numbers, reconstruct_toc1, repair_toc_tree
+from .parsing import (
+    inherit_page_numbers,
+    reconstruct_toc1,
+    repair_toc_tree,
+    restore_toc_order,
+)
 from .utils import (
     _roman_to_int,
     compute_file_hash,
@@ -70,6 +77,7 @@ def build_toc_local_ocr(
     toc_tree1 = reconstruct_toc1(toc_results, page_heights)
     toc_tree1 = repair_toc_tree(toc_tree1)
     toc_tree1 = inherit_page_numbers(toc_tree1)
+    toc_tree1 = restore_toc_order(toc_tree1)
     if do_debug:
         import json
 
@@ -90,7 +98,7 @@ def add_bookmarks_to_pdf(
     page_map: dict[str, int] | None = None,
     front_offset: int | None = None,
     arabic_segments: list[dict] | None = None,
-) -> None:
+) -> list[str]:
     """Add PDF outline (bookmarks) from a TOC tree using printed-page -> PDF index mapping.
 
     ``page_map`` (from :mod:`toc_forge.page_map`) converts "X-n" page
@@ -101,7 +109,7 @@ def add_bookmarks_to_pdf(
     pages, so they need their own offset.
     """
 
-    def _page_num_to_pdf(page_num: int | str | None) -> int:
+    def _page_num_to_pdf(page_num: int | str | None) -> int | None:
         """Map a printed page number to a 1-based PDF page number (pymupdf convention)."""
         if isinstance(page_num, int):
             mapped = map_arabic_page(arabic_segments, page_num)
@@ -120,19 +128,21 @@ def add_bookmarks_to_pdf(
                 if r is not None:
                     base = front_offset if front_offset is not None else page_offset
                     return r + base + 1
-                return 1
-        return 1
+                return None
+        return None
 
     def _first_page_num(node: dict) -> int | str | None:
         """Find the first valid page number in a subtree."""
         pn = node.get("page_num")
-        if isinstance(pn, int):
+        if isinstance(pn, (int, str)):
             return pn
         for child in node.get("children", []):
             result = _first_page_num(child)
             if result is not None:
                 return result
         return None
+
+    skipped_titles: list[str] = []
 
     def _build_outline(node: dict, level: int) -> list[list]:
         entries = []
@@ -144,23 +154,44 @@ def add_bookmarks_to_pdf(
 
         pdf_page = _page_num_to_pdf(pn)
         page_count = doc.page_count
-        if pdf_page < 1:
-            pdf_page = 1
-        elif pdf_page > page_count:
-            pdf_page = page_count
-
-        entries.append([level, title, pdf_page])
+        if pdf_page is None or not 1 <= pdf_page <= page_count:
+            skipped_titles.append(title)
+            logger.warning(
+                "Skipping bookmark with unresolved/out-of-range page: %s (%r)",
+                title,
+                pn,
+            )
+            child_level = level
+        else:
+            entries.append([level, title, pdf_page])
+            child_level = level + 1
         for child in node.get("children", []):
-            entries.extend(_build_outline(child, level + 1))
+            entries.extend(_build_outline(child, child_level))
         return entries
 
     outline = []
     for node in toc_tree:
         outline.extend(_build_outline(node, 1))
 
-    if outline:
-        doc.set_toc(outline)
-    doc.save(output_path)
+    if not outline:
+        raise EmptyTocError("目录中没有可解析页码的书签条目")
+    doc.set_toc(outline)
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    os.makedirs(output_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{Path(output_path).stem}-", suffix=".tmp.pdf", dir=output_dir
+    )
+    os.close(fd)
+    os.unlink(tmp_path)
+    try:
+        doc.save(tmp_path)
+        os.replace(tmp_path, output_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+    return skipped_titles
 
 
 def bookmark_pdf(
@@ -181,6 +212,7 @@ def bookmark_pdf(
     engine: str | None = None,
     enable_mkldnn: bool | None = None,
     ocr_model_size: str = "server",
+    output_filename: str | None = None,
 ) -> tuple[str, float, dict]:
     start_time = time.perf_counter()
     pdf_hash = compute_file_hash(input) if cache_dir else None
@@ -296,8 +328,8 @@ def bookmark_pdf(
     # 目录页去噪：只保留最大连续页段，丢弃孤立误检（如 [5, 7, 8, 9] -> [7, 8, 9]）
     toc_pages = keep_longest_contiguous_pages(toc_pages)
     if not toc_pages:
-        print("未检测到目录页")
-        return "", 0, {}
+        doc.close()
+        raise TocNotFoundError("未检测到目录页")
 
     if toc_strategy == "vllm":
         toc_tree1 = build_toc_vllm(
@@ -338,6 +370,10 @@ def bookmark_pdf(
             cache_dir=cache_dir,
             pdf_hash=pdf_hash,
         )
+
+    if not toc_tree1:
+        doc.close()
+        raise EmptyTocError("目录提取结果为空")
 
     # 页码偏移：直接用布局检测的 number box 位置截取小图 + PaddleOCR 扫描
     # （get_page_offset2），不再调用 PPStructureV3（加载子模型多、耗时长）。
@@ -435,8 +471,17 @@ def bookmark_pdf(
     # add bookmarks to PDF
     if not os.path.exists(output):
         os.makedirs(output)
-    pdf_bookmarks_path = os.path.join(output, f"{Path(input).stem}_bookmarked.pdf")
-    add_bookmarks_to_pdf(
+    if output_filename is not None:
+        if (
+            os.path.basename(output_filename) != output_filename
+            or not output_filename.lower().endswith(".pdf")
+        ):
+            raise ValueError("output_filename must be a PDF basename")
+        output_basename = output_filename
+    else:
+        output_basename = f"{Path(input).stem}_bookmarked.pdf"
+    pdf_bookmarks_path = os.path.join(output, output_basename)
+    skipped_titles = add_bookmarks_to_pdf(
         doc,
         toc_tree1,
         page_offset,
@@ -445,6 +490,12 @@ def bookmark_pdf(
         front_offset=front_offset,
         arabic_segments=arabic_segments,
     )
+    if skipped_titles:
+        logger.warning(
+            "Skipped %d unresolved bookmark(s): %s",
+            len(skipped_titles),
+            ", ".join(skipped_titles[:10]),
+        )
 
     def update_page_offset(toc_tree1, page_offset):
         for item in toc_tree1:
@@ -458,4 +509,5 @@ def bookmark_pdf(
     end_time = time.perf_counter()
     time_cost = end_time - start_time
     logger.debug(f"process {Path(input).stem} cost: {time_cost:.2f} seconds")
+    doc.close()
     return pdf_bookmarks_path, time_cost, toc_tree1

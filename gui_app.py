@@ -1,29 +1,30 @@
 """TOC Forge — desktop GUI."""
-import json
 import locale
 import os
 import subprocess
 import threading
-import time
 import tkinter as tk
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from tkinter import filedialog, ttk
 
 import requests
-import sv_ttk
 
-_MODEL_NAMES = [
-    "PP-DocLayout_plus-L",
-    "PP-LCNet_x1_0_doc_ori",
-    "PP-OCRv5_mobile_det",
-    "PP-OCRv5_mobile_rec",
-]
+from toc_forge.gui_support import (
+    MODEL_FILES as _MODEL_FILES,
+    MODEL_NAMES as _MODEL_NAMES,
+    all_models_exist,
+    default_settings_path,
+    load_settings,
+    model_is_complete,
+    plan_output_names,
+    save_settings,
+    stream_download as _stream_download,
+)
 
 # GUI 固定使用 onnxruntime 引擎（bookmark_pdf 里 engine="onnxruntime"），
 # 每个模型只需 2 个文件：inference.onnx + inference.yml。
 # 官方 onnx 版仓库为 PaddlePaddle/{name}_onnx（ModelScope / HuggingFace 均有）。
-_MODEL_FILES = ("inference.yml", "inference.onnx")
 _MODEL_SOURCES = {
     "modelscope": "https://www.modelscope.cn/models/PaddlePaddle/{name}_onnx/resolve/master/{file}",
     "huggingface": "https://huggingface.co/PaddlePaddle/{name}_onnx/resolve/main/{file}",
@@ -146,37 +147,6 @@ def t(key: str, **kwargs: object) -> str:
 #  model download with progress
 # ---------------------------------------------------------------------------
 
-def _stream_download(url: str, dst: str, progress_cb: Callable[[float], None] | None, retries: int = 3) -> None:
-    """带重试的流式下载。
-
-    CDN/中间代理经常在正文未传完时断连（requests 抛 IncompleteRead），
-    此时本地文件是残缺的，必须整文件重下。4xx（如 404）不重试。
-    """
-    last_err: Exception | None = None
-    for attempt in range(retries):
-        try:
-            with requests.get(url, stream=True, timeout=30) as r:
-                r.raise_for_status()
-                total = int(r.headers.get("content-length", 0))
-                dl = 0
-                with open(dst, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=65536):
-                        dl += len(chunk)
-                        f.write(chunk)
-                        if progress_cb and total:
-                            progress_cb(dl / total)
-                if total and dl != total:
-                    raise requests.ConnectionError(f"incomplete download: {dl} of {total} bytes")
-            return
-        except (requests.RequestException, OSError) as exc:
-            if isinstance(exc, requests.HTTPError) and exc.response is not None and 400 <= exc.response.status_code < 500:
-                raise
-            last_err = exc
-            if attempt < retries - 1:
-                time.sleep(1.0 + attempt)
-    raise requests.ConnectionError(f"download failed after {retries} attempts: {last_err}")
-
-
 def _download_model_files(model_dir: str, model_name: str, source: str, progress_cb: Callable[[str, float], None] | None) -> None:
     """ModelScope / HuggingFace 源：从 {name}_onnx 仓库逐文件下载 onnx 推理文件。"""
     template = _MODEL_SOURCES[source]
@@ -202,13 +172,16 @@ def _download_model(model_dir: str, model_name: str, source: str = "modelscope",
     target = os.path.join(model_dir, model_name)
     # 存在性以 inference.onnx 为准：onnxruntime 引擎只认 onnx 文件，
     # 旧的 paddle 格式目录（无 onnx）会被重新下载补全
-    if os.path.isfile(os.path.join(target, "inference.onnx")):
+    if model_is_complete(model_dir, model_name):
         if progress_cb:
             progress_cb(t("dl_exists", name=model_name), 1.0)
         return
 
     os.makedirs(model_dir, exist_ok=True)
     _download_model_files(model_dir, model_name, source, progress_cb)
+
+    if not model_is_complete(model_dir, model_name):
+        raise OSError(f"downloaded model is incomplete: {model_name}")
 
     if progress_cb:
         progress_cb(t("dl_ready", name=model_name), 1.0)
@@ -240,34 +213,20 @@ def download_all_models(model_dir: str, source: str = "modelscope", progress_cb:
             future.result()  # 第一个异常往上抛，其余 worker 继续跑完
 
 
-def all_models_exist(model_dir: str) -> bool:
-    # 目录存在不算数：onnxruntime 引擎需要每个模型目录含 inference.onnx
-    return all(
-        os.path.isfile(os.path.join(model_dir, n, "inference.onnx"))
-        for n in _MODEL_NAMES
-    )
-
-
 # ---------------------------------------------------------------------------
 #  settings persistence
 # ---------------------------------------------------------------------------
 
-_SETTINGS_PATH = os.path.join(os.path.dirname(__file__), ".gui_settings.json")
+_SETTINGS_PATH = default_settings_path()
+_LEGACY_SETTINGS_PATH = os.path.join(os.path.dirname(__file__), ".gui_settings.json")
 
 
 def _load_settings() -> dict:
-    if os.path.isfile(_SETTINGS_PATH):
-        try:
-            with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return {}
-    return {}
+    return load_settings(_SETTINGS_PATH, legacy_path=_LEGACY_SETTINGS_PATH)
 
 
 def _save_settings(settings: dict) -> None:
-    with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
+    save_settings(settings, _SETTINGS_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +255,8 @@ class TocForgeApp:
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        import sv_ttk
+
         main = ttk.Frame(self.root, padding="24 20 24 20")
         main.pack(fill=tk.BOTH, expand=True)
 
@@ -563,7 +524,9 @@ class TocForgeApp:
             self.model_status_var.set(t("models_ok"))
             self.model_progress["value"] = 100
         else:
-            missing = sum(1 for n in _MODEL_NAMES if not os.path.isdir(os.path.join(model_dir, n)))
+            missing = sum(
+                1 for n in _MODEL_NAMES if not model_is_complete(model_dir, n)
+            )
             self.model_status_var.set(t("models_missing", n=missing))
             self.model_progress["value"] = 0
         self._toggle_model_section()
@@ -647,6 +610,7 @@ class TocForgeApp:
             self.status_var.set(t("pdf_only"))
             return
         output_dir = self.output_dir_var.get().strip() or "output"
+        output_names = plan_output_names(pdf_paths)
         model_dir = self.model_dir_var.get().strip() or "./models"
         strategy = self.strategy_var.get()
 
@@ -688,7 +652,7 @@ class TocForgeApp:
                 vllm_name = model_name if strategy == "vllm" else None
                 # 串行处理每个文件；任一个失败即中断并标注文件名
                 results = []
-                for pdf_path in pdf_paths:
+                for pdf_path, output_name in zip(pdf_paths, output_names):
                     try:
                         pdf_out, elapsed, _ = toc_forge.bookmark_pdf(
                             input=pdf_path,
@@ -713,7 +677,8 @@ class TocForgeApp:
                             # GUI 只有 CPU 可用，用 mobile OCR（PP-OCRv5_mobile_det/rec）
                             # 大幅缩短推理时间；精度略低，需要更高精度时改回 server
                             ocr_model_size="mobile",
-                            engine="onnxruntime"
+                            engine="onnxruntime",
+                            output_filename=output_name,
                         )
                     except Exception as exc:
                         raise RuntimeError(f"{os.path.basename(pdf_path)}: {exc}") from exc

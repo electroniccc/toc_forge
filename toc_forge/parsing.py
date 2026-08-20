@@ -7,28 +7,58 @@ from collections import defaultdict
 import numpy as np
 from sklearn.cluster import KMeans
 
-from .utils import _roman_to_int, _section_sort_key
+from .utils import _roman_to_int
 
 logger = logging.getLogger(__name__)
 
 
-def _page_num_sort_key(page_num) -> int:
-    """Numerical sort key for a page number.
+_ROMAN_PAGE_PAT = re.compile(r"^[IVXLCDM]+$", re.IGNORECASE)
+_ROMAN_ARABIC_PAGE_PAT = re.compile(
+    r"^([IVXLCDM]+)\s*[-–−]\s*(\d+)$", re.IGNORECASE
+)
 
-    Page numbers may be int, None, or strings ("VII", "I-1") from the
-    Roman-numeral front-matter / chapter-page parsing — a bare
-    ``page_num or 99999`` would compare str with int and crash.
+
+def _page_num_sort_key(page_num: int | str | None) -> int | None:
+    """Return the numerical position within one page-numbering system.
+
+    Besides ordinary integer pages, TOC nodes may carry Roman front-matter
+    pages (``VII``) or chapter-local pages (``II-12``).  ``None`` and unknown
+    strings are deliberately unresolved instead of being mapped to a large
+    sentinel: callers must not move unresolved entries to the end.
     """
-    if isinstance(page_num, int):
+    if isinstance(page_num, int) and not isinstance(page_num, bool):
         return page_num
-    if isinstance(page_num, str):
-        r = _roman_to_int(page_num)
-        if r is not None:
-            return r
-        m = re.search(r"\d+", page_num)
-        if m:
-            return int(m.group())
-    return 99999
+    if not isinstance(page_num, str):
+        return None
+
+    text = page_num.strip()
+    if text.isdigit():
+        return int(text)
+    chapter_page = _ROMAN_ARABIC_PAGE_PAT.fullmatch(text)
+    if chapter_page:
+        return int(chapter_page.group(2))
+    if _ROMAN_PAGE_PAT.fullmatch(text):
+        return _roman_to_int(text)
+    return None
+
+
+def _page_num_sort_family(page_num: int | str | None) -> str | None:
+    """Identify page-numbering systems that are safe to compare together."""
+    if isinstance(page_num, int) and not isinstance(page_num, bool):
+        return "arabic"
+    if not isinstance(page_num, str):
+        return None
+
+    text = page_num.strip()
+    if text.isdigit():
+        return "arabic"
+    chapter_page = _ROMAN_ARABIC_PAGE_PAT.fullmatch(text)
+    if chapter_page:
+        chapter = _roman_to_int(chapter_page.group(1))
+        return f"roman-arabic:{chapter}" if chapter is not None else None
+    if _ROMAN_PAGE_PAT.fullmatch(text):
+        return "roman"
+    return None
 
 
 # English chapter-like title patterns (used by _merge_page_trees' chapter
@@ -148,16 +178,10 @@ def _parse_toc_lines(
                 lines.append([item])
 
     # ---- Step 4: parse each line -> (title, page_num, min_xmin, avg_ymin) ----
-    ignore_titles = {
-        "目录",
-        "目次",
-        "前言",
-        "序言",
-        "附录",
-        "索引",
-        "编后记",
-        "作者简介",
-    }
+    # Only the heading of the TOC itself is always noise.  Front/back matter
+    # such as 前言、附录 and 索引 are legitimate bookmark targets when they
+    # appear as entries in the TOC.
+    ignore_titles = {"目录", "目次"}
 
     paren_digit_pat = re.compile(r"^[\(（]\d+[\)）]$")
     rightmost_items = []
@@ -465,13 +489,6 @@ def _merge_page_trees(
                             parent = last_child
                     target = parent if parent is not None else last
                     target["children"].append(node)
-                    if target["children"]:
-                        target["children"].sort(
-                            key=lambda c: (
-                                _page_num_sort_key(c.get("page_num")),
-                                _section_sort_key(c["title"]),
-                            )
-                        )
                     continue
             merged.append(node)
     return merged
@@ -748,14 +765,6 @@ def repair_toc_tree(tree: list[dict]) -> list[dict]:
                     continue
             result.append(node)
 
-        for ch in chapters.values():
-            if ch.get("children"):
-                ch["children"].sort(
-                    key=lambda c: (
-                        _page_num_sort_key(c.get("page_num")),
-                        _section_sort_key(c["title"]),
-                    )
-                )
         return result
 
     def _sec_ordinal(title: str) -> int | None:
@@ -772,51 +781,27 @@ def repair_toc_tree(tree: list[dict]) -> list[dict]:
         ``总习题`` / ``本章小结`` / ``思考题`` stay at chapter level
         (same level as sections).
         """
-        sections: list[dict] = []
-        exercises: list[dict] = []
-        keep: list[dict] = []
+        sections = [
+            child for child in children if _sec_num_pat.match(child["title"])
+        ]
+        result: list[dict] = []
 
+        # Walk the source list once.  Matching exercises are moved under their
+        # section, while every other entry retains its OCR/source position.
+        # Page numbers are deliberately not a structural sort key: missing
+        # numbers are filled only after this repair pass.
         for child in children:
-            if _sec_num_pat.match(child["title"]):
-                sections.append(child)
-            elif _ex_num_pat.match(child["title"]):
-                exercises.append(child)
-            else:
-                keep.append(child)
-
-        for ex in exercises:
-            ex_m = _ex_num_pat.match(ex["title"])
+            ex_m = _ex_num_pat.match(child["title"])
             if ex_m:
                 sec_num = int(ex_m.group(2))
-                parent = None
-                for sec in sections:
-                    if _sec_ordinal(sec["title"]) == sec_num:
-                        parent = sec
-                        break
-                if parent is not None:
-                    parent.setdefault("children", []).append(ex)
-                    continue
-            keep.append(ex)
-
-        for sec in sections:
-            if sec.get("children"):
-                sec["children"].sort(
-                    key=lambda c: (
-                        _page_num_sort_key(c.get("page_num")),
-                        _section_sort_key(c["title"]),
-                    )
+                parent = next(
+                    (sec for sec in sections if _sec_ordinal(sec["title"]) == sec_num),
+                    None,
                 )
-
-        result = sorted(
-            sections,
-            key=lambda c: (_page_num_sort_key(c.get("page_num")), _section_sort_key(c["title"])),
-        )
-        result.extend(
-            sorted(
-                keep,
-                key=lambda c: (_page_num_sort_key(c.get("page_num")), _section_sort_key(c["title"])),
-            )
-        )
+                if parent is not None:
+                    parent.setdefault("children", []).append(child)
+                    continue
+            result.append(child)
         return result
 
     # ---- Pass 0: nest 章 under 篇 ----
@@ -842,12 +827,6 @@ def repair_toc_tree(tree: list[dict]) -> list[dict]:
         if node.get("children"):
             if _is_chapter(node) or ch_like.match(node["title"]):
                 node["children"] = _fix_chapter_children(node["children"])
-            node["children"].sort(
-                key=lambda c: (
-                    _page_num_sort_key(c.get("page_num")),
-                    _section_sort_key(c["title"]),
-                )
-            )
 
     return fixed_root
 
@@ -893,4 +872,46 @@ def inherit_page_numbers(
 
     for i, node in enumerate(tree):
         _fix_node(node, tree, i)
+    return tree
+
+
+def restore_toc_order(tree: list[dict]) -> list[dict]:
+    """Repair locally inverted sibling order after page-number inheritance.
+
+    Indentation reconstruction and structural re-parenting can leave part of a
+    chapter's children out of order.  Reorder a sibling list only when every
+    node has a resolvable page number in the same numbering system.  Python's
+    stable sort preserves source order for entries sharing a page.  Root nodes
+    are intentionally left alone because front matter and body chapters often
+    use different numbering systems.
+    """
+
+    def _restore_children(node: dict) -> None:
+        children = node.get("children", [])
+        for child in children:
+            _restore_children(child)
+
+        if len(children) < 2:
+            return
+        keys = [_page_num_sort_key(child.get("page_num")) for child in children]
+        families = [
+            _page_num_sort_family(child.get("page_num")) for child in children
+        ]
+        if any(key is None for key in keys) or any(
+            family is None for family in families
+        ):
+            return
+        if len(set(families)) != 1:
+            return
+
+        node["children"] = [
+            child
+            for _, child in sorted(
+                zip(keys, children),
+                key=lambda pair: pair[0],
+            )
+        ]
+
+    for root in tree:
+        _restore_children(root)
     return tree

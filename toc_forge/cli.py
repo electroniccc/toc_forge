@@ -2,8 +2,10 @@
 
 import logging
 import os
+import sys
 from argparse import ArgumentParser
 
+from .errors import TocForgeError
 from .pipeline import bookmark_pdf
 from .utils import format_duration, setup_logger
 
@@ -116,24 +118,28 @@ def main() -> None:
 
     logger.info("toc_strategy=%s", toc_strategy)
 
-    pdf_bookmarks_path, time_cost, _ = bookmark_pdf(
-        args.input,
-        args.output,
-        args.model_dir,
-        do_debug=args.debug,
-        cache_dir=args.cache_dir,
-        toc_strategy=toc_strategy,
-        api_base_url=api_base_url,
-        api_key=api_key,
-        llm_name=args.llm_name,
-        vllm_name=args.vllm_name,
-        no_toc_cache=args.no_toc_cache,
-        device=args.device,
-        llm_timeout=args.llm_timeout,
-        engine=args.engine,
-        enable_mkldnn=False if args.disable_mkldnn else None,
-        ocr_model_size=args.ocr_model_size,
-    )
+    try:
+        pdf_bookmarks_path, time_cost, _ = bookmark_pdf(
+            args.input,
+            args.output,
+            args.model_dir,
+            do_debug=args.debug,
+            cache_dir=args.cache_dir,
+            toc_strategy=toc_strategy,
+            api_base_url=api_base_url,
+            api_key=api_key,
+            llm_name=args.llm_name,
+            vllm_name=args.vllm_name,
+            no_toc_cache=args.no_toc_cache,
+            device=args.device,
+            llm_timeout=args.llm_timeout,
+            engine=args.engine,
+            enable_mkldnn=False if args.disable_mkldnn else None,
+            ocr_model_size=args.ocr_model_size,
+        )
+    except TocForgeError as exc:
+        print(f"toc-forge: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
     print(
         f"Bookmarked PDF saved to: {pdf_bookmarks_path}, "
         f"Time elapsed: {format_duration(time_cost)}"

@@ -19,6 +19,13 @@ dependencies = [
     "openai",
 ]
 
+[project.optional-dependencies]
+gui = [
+    "requests",
+    "sv-ttk",
+    "onnxruntime>=1.27,<1.28",
+]
+
 [project.scripts]
 toc-forge = "toc_forge.cli:main"
 

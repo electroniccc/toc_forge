@@ -21,7 +21,8 @@ _TOC_LLM_SYSTEM_PROMPT = (
     "The input is a JSON array where each element has:\n"
     '- "page": PDF page index (0-based)\n'
     '- "lines": array of text strings from that TOC page, in reading order. '
-    "Each line is a TOC entry (title) optionally followed by its page number.\n\n"
+    "A line usually contains one TOC entry, but compact layouts may place several "
+    "independent entries on the same physical line.\n\n"
     "How to determine hierarchy from text patterns (language-agnostic):\n"
     "- Top level: parts/chapters/front-back matter, e.g. '第X篇', '第X章', 'Part X', "
     "'Chapter X', 'Preface', 'Introduction', 'Appendix', 'Bibliography', 'Index', or "
@@ -37,11 +38,28 @@ _TOC_LLM_SYSTEM_PROMPT = (
     "the same level; follow the document's dominant scheme rather than a fixed vocabulary.\n\n"
     "Rules:\n"
     '- Each output node: "title" (str), "page_num" (int or null), "children" (list of nodes)\n'
-    "- The last number on a line is the page number; remove it from the title\n"
+    "- IMPORTANT: a page-number marker is metadata, never part of the title. It may "
+    "be a trailing plain number or a number in parentheses, using either half-width "
+    "or full-width punctuation, such as 'Title 12', 'Title (12)', or '标题（12）'. "
+    "Put the number only in page_num and always remove the entire marker, including "
+    "its parentheses, from title. If page_num is 12, title must not end in '12', "
+    "'(12)', or '（12）'.\n"
+    "- If one physical/OCR line contains repeated title-plus-page-number groups, split "
+    "them into separate sibling nodes in source order instead of treating the whole "
+    "line as one title. Required Chinese output example: '一、映射(1) 二、函数(3) "
+    "习题 1–1(16)' becomes "
+    '[{"title":"一、映射","page_num":1,"children":[]},'
+    '{"title":"二、函数","page_num":3,"children":[]},'
+    '{"title":"习题 1–1","page_num":16,"children":[]}]. '
+    "Required English output example: 'Limits (105) Derivatives (125) Exercises 2.1 "
+    "(140)' becomes "
+    '[{"title":"Limits","page_num":105,"children":[]},'
+    '{"title":"Derivatives","page_num":125,"children":[]},'
+    '{"title":"Exercises 2.1","page_num":140,"children":[]}].\n'
     "- Drop trailing dot-leaders (…, ...) from titles\n"
     "- Join fragmented titles that clearly belong together (e.g. a chapter title split across lines)\n"
-    '- Preserve the full title text including chapter/section numbers, in the original '
-    'language ("第1章", "Chapter 1", "1.1")\n'
+    '- Preserve the complete title text, excluding page-number markers, including '
+    'chapter/section numbers in the original language ("第1章", "Chapter 1", "1.1").\n'
     "- If a page number is missing on a heading, inherit from its first child\n"
     "- PDF bookmarks cannot render LaTeX. Never use $...$ in titles. Always write\n"
     "  math in plain Unicode: Greek symbols (α, β, λ, ∫, ∑, ∇, Δ, ∞, ℏ, ±, →, ×, ∂),\n"
@@ -70,9 +88,28 @@ _TOC_VLLM_SYSTEM_PROMPT = (
     "- Entries at the same indentation and with the same numbering scheme belong to "
     "the same level.\n\n"
     "Rules:\n"
-    '- Preserve the full title text including chapter/section numbers, in the original '
-    'language ("第1章", "Chapter 1", "1.1", etc.).\n'
-    "- Page numbers are the rightmost numbers on the same line. If missing, inherit from children.\n"
+    '- Preserve the complete title text, excluding page-number markers, including '
+    'chapter/section numbers in the original language ("第1章", "Chapter 1", "1.1").\n'
+    "- IMPORTANT: a page-number marker is metadata, never part of the title. It may "
+    "be a trailing plain number or a number in parentheses, using either half-width "
+    "or full-width punctuation, such as 'Title 12', 'Title (12)', or '标题（12）'. "
+    "Put the number only in page_num and always remove the entire marker, including "
+    "its parentheses, from title. If page_num is 12, title must not end in '12', "
+    "'(12)', or '（12）'.\n"
+    "- Compact TOC layouts may put several independent entries on one physical row. "
+    "When a row contains repeated title-plus-page-number groups, split them into "
+    "separate sibling nodes in visual/source order; never keep the entire row as one "
+    "title. Required Chinese output example: '一、映射(1) 二、函数(3) 习题 1–1(16)' "
+    "becomes "
+    '[{"title":"一、映射","page_num":1,"children":[]},'
+    '{"title":"二、函数","page_num":3,"children":[]},'
+    '{"title":"习题 1–1","page_num":16,"children":[]}]. '
+    "Required English output example: 'Limits (105) Derivatives (125) Exercises 2.1 "
+    "(140)' becomes "
+    '[{"title":"Limits","page_num":105,"children":[]},'
+    '{"title":"Derivatives","page_num":125,"children":[]},'
+    '{"title":"Exercises 2.1","page_num":140,"children":[]}].\n'
+    "- If a heading has no page number, inherit it from its first child.\n"
     '- Ignore running headers/footers and standalone TOC headings such as "目录", '
     '"Contents", "Table of Contents".\n'
     "- For mathematical and physical symbols in titles (Greek letters, operators, arrows, "
@@ -90,15 +127,16 @@ _TOC_VLLM_SYSTEM_PROMPT = (
 
 
 def _build_llm_client(
-    model: str | None = None,
+    base_url: str,
     api_key: str | None = None,
-    base_url: str | None = None,
     timeout: float = 600.0,
     max_retries: int = 0,
 ) -> OpenAI:
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise ValueError("llm_base_url is required")
     return OpenAI(
         api_key=api_key or os.environ.get("OPENAI_API_KEY", "sk-placeholder"),
-        base_url=base_url or os.environ.get("OPENAI_BASE_URL"),
+        base_url=base_url,
         timeout=httpx.Timeout(timeout, read=timeout, write=60.0, connect=30.0),
         max_retries=max_retries,
     )
@@ -146,7 +184,14 @@ def _simplify_ocr_for_llm(toc_results: list[dict]) -> list[dict]:
                 t = str(text).strip()
                 if not t:
                     continue
-                items.append({"text": t, "ymin": box[1], "ymax": box[3]})
+                items.append(
+                    {
+                        "text": t,
+                        "xmin": box[0],
+                        "ymin": box[1],
+                        "ymax": box[3],
+                    }
+                )
 
             if not items:
                 continue
@@ -167,7 +212,7 @@ def _simplify_ocr_for_llm(toc_results: list[dict]) -> list[dict]:
                     line_groups.append([item])
 
             for group in line_groups:
-                group.sort(key=lambda x: x["ymin"])
+                group.sort(key=lambda x: x["xmin"])
                 line_text = " ".join(g["text"] for g in group)
                 page_lines.append(line_text)
 
@@ -177,13 +222,17 @@ def _simplify_ocr_for_llm(toc_results: list[dict]) -> list[dict]:
 
 
 def _toc_tree_cache_path(
-    cache_dir: str, pdf_hash: str, toc_strategy: str
+    cache_dir: str,
+    pdf_hash: str,
+    toc_strategy: str,
 ) -> str:
     return _cache_path(cache_dir, pdf_hash, f"toc_tree_{toc_strategy}")
 
 
 def _load_toc_tree_cache(
-    cache_dir: str | None, pdf_hash: str | None, toc_strategy: str
+    cache_dir: str | None,
+    pdf_hash: str | None,
+    toc_strategy: str,
 ) -> list[dict] | None:
     """Return the cached TOC tree for this document/strategy, or None."""
     if not cache_dir or not pdf_hash:
@@ -198,7 +247,10 @@ def _load_toc_tree_cache(
 
 
 def _save_toc_tree_cache(
-    cache_dir: str | None, pdf_hash: str | None, toc_strategy: str, toc_tree: list[dict]
+    cache_dir: str | None,
+    pdf_hash: str | None,
+    toc_strategy: str,
+    toc_tree: list[dict],
 ) -> None:
     """Persist the TOC tree so repeat runs skip the LLM call."""
     if not cache_dir or not pdf_hash:
@@ -366,13 +418,13 @@ def build_toc_llm(
     toc_pages: list[dict],
     page_imgs,
     ocr_model,
+    llm_model: str,
+    llm_base_url: str,
     do_debug: bool = False,
     output: str = "output",
     cache_dir: str | None = None,
     pdf_hash: str | None = None,
-    llm_model: str | None = None,
     llm_api_key: str | None = None,
-    llm_base_url: str | None = None,
     no_toc_cache: bool = False,
     llm_timeout: float = 600.0,
 ) -> list[dict]:
@@ -382,6 +434,10 @@ def build_toc_llm(
     cache hit skips the LLM call entirely (and the OCR it depends on).
     Set ``no_toc_cache`` to force a re-call even when a cache exists.
     """
+    if not isinstance(llm_model, str) or not llm_model.strip():
+        raise ValueError("llm_model is required")
+    if not isinstance(llm_base_url, str) or not llm_base_url.strip():
+        raise ValueError("llm_base_url is required")
     if not no_toc_cache:
         cached = _load_toc_tree_cache(cache_dir, pdf_hash, "llm")
         if cached is not None:
@@ -411,13 +467,12 @@ def build_toc_llm(
             f.write(ocr_json)
 
     client = _build_llm_client(
-        model=llm_model, api_key=llm_api_key, base_url=llm_base_url,
+        base_url=llm_base_url, api_key=llm_api_key,
         timeout=llm_timeout,
     )
-    model = llm_model or os.environ.get("OPENAI_MODEL", "gpt-4o")
     result = _call_llm(
         client,
-        model,
+        llm_model,
         _TOC_LLM_SYSTEM_PROMPT,
         [
             {"type": "text", "text": ocr_json},
@@ -432,11 +487,11 @@ def build_toc_llm(
 def build_toc_vllm(
     toc_pages: list[dict],
     page_imgs,
+    llm_model: str,
+    llm_base_url: str,
     do_debug: bool = False,
     output: str = "output",
-    llm_model: str | None = None,
     llm_api_key: str | None = None,
-    llm_base_url: str | None = None,
     cache_dir: str | None = None,
     pdf_hash: str | None = None,
     no_toc_cache: bool = False,
@@ -448,17 +503,19 @@ def build_toc_vllm(
     cache hit skips the vision-LLM call entirely. Set ``no_toc_cache`` to
     force a re-call even when a cache exists.
     """
+    if not isinstance(llm_model, str) or not llm_model.strip():
+        raise ValueError("llm_model is required")
+    if not isinstance(llm_base_url, str) or not llm_base_url.strip():
+        raise ValueError("llm_base_url is required")
     if not no_toc_cache:
         cached = _load_toc_tree_cache(cache_dir, pdf_hash, "vllm")
         if cached is not None:
             return _sanitize_toc_tree(cached)
 
     client = _build_llm_client(
-        model=llm_model, api_key=llm_api_key, base_url=llm_base_url,
+        base_url=llm_base_url, api_key=llm_api_key,
         timeout=llm_timeout,
     )
-    model = llm_model or os.environ.get("OPENAI_MODEL", "gpt-4o")
-
     content: list[dict] = []
     for tp in toc_pages:
         page_idx = tp["page"]
@@ -478,7 +535,7 @@ def build_toc_vllm(
         }
     )
     result = _call_llm(
-        client, model, _TOC_VLLM_SYSTEM_PROMPT, content,
+        client, llm_model, _TOC_VLLM_SYSTEM_PROMPT, content,
     )
     toc_tree = result.get("toc", []) if isinstance(result, dict) else result
     toc_tree = _sanitize_toc_tree(toc_tree)
