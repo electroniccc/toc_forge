@@ -7,12 +7,15 @@ import os
 import re
 import shutil
 import tempfile
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import cv2
 import pymupdf
 import numpy as np
+import requests
 from PIL import Image
 
 logger = logging.getLogger(__name__)
@@ -23,6 +26,11 @@ _BOS_BASE_URL = (
     "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model"
 )
 _BOS_VERSION = "paddle3.0.0"
+_ONNX_MODEL_SOURCE = (
+    "https://www.modelscope.cn/models/PaddlePaddle/{model_name}_onnx/"
+    "resolve/master/{filename}"
+)
+_ONNX_MODEL_FILES = ("inference.yml", "inference.onnx")
 
 # ---- Chinese numeral helpers ----
 _CN_NUM = "一二三四五六七八九十"
@@ -280,6 +288,112 @@ def setup_logger(log_dir: str) -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[handler],
     )
+
+
+def model_directory_name(model_name: str, engine: str | None = None) -> str:
+    """Return the isolated storage directory for a model and inference engine.
+
+    Paddle-format weights live in ``{model_name}``; ONNX Runtime weights live
+    in ``{model_name}_onnx``.  Keeping the formats apart prevents a later
+    Paddle download from sharing a directory with ``inference.onnx``.
+    """
+    if engine and engine.strip().lower() == "onnxruntime":
+        return f"{model_name}_onnx"
+    return model_name
+
+
+def _onnx_model_missing_files(model_dir: str, model_name: str) -> list[str]:
+    target = os.path.join(model_dir, model_directory_name(model_name, "onnxruntime"))
+    return [
+        filename
+        for filename in _ONNX_MODEL_FILES
+        if not os.path.isfile(os.path.join(target, filename))
+    ]
+
+
+def stream_download(
+    url: str,
+    dst: str,
+    progress_cb: Callable[[float], None] | None,
+    retries: int = 3,
+) -> None:
+    """Download to ``dst.part`` and atomically replace ``dst`` on success."""
+    destination = os.path.abspath(dst)
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    part_path = destination + ".part"
+    last_err: Exception | None = None
+
+    for attempt in range(retries):
+        try:
+            with requests.get(url, stream=True, timeout=30) as response:
+                response.raise_for_status()
+                total = int(response.headers.get("content-length", 0))
+                downloaded = 0
+                with open(part_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=65536):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_cb and total:
+                            progress_cb(downloaded / total)
+                    f.flush()
+                    os.fsync(f.fileno())
+                if downloaded == 0 or (total and downloaded != total):
+                    raise requests.ConnectionError(
+                        f"incomplete download: {downloaded} of {total} bytes"
+                    )
+            os.replace(part_path, destination)
+            return
+        except (requests.RequestException, OSError) as exc:
+            try:
+                os.unlink(part_path)
+            except FileNotFoundError:
+                pass
+            if (
+                isinstance(exc, requests.HTTPError)
+                and exc.response is not None
+                and 400 <= exc.response.status_code < 500
+            ):
+                raise
+            last_err = exc
+            if attempt < retries - 1:
+                time.sleep(1.0 + attempt)
+
+    raise requests.ConnectionError(
+        f"download failed after {retries} attempts: {last_err}"
+    )
+
+
+def make_sure_onnx_model_exists(model_dir: str, model_name: str) -> None:
+    """Download a missing ONNX Runtime model into its isolated directory.
+
+    The CLI has no GUI download action, so a first run fetches the two official
+    ONNX files. It deliberately never treats the Paddle directory as a cache
+    hit: ``{model_name}`` and ``{model_name}_onnx`` are different formats.
+    """
+    missing = _onnx_model_missing_files(model_dir, model_name)
+    if missing:
+        target = os.path.join(
+            model_dir, model_directory_name(model_name, "onnxruntime")
+        )
+        os.makedirs(target, exist_ok=True)
+        for filename in missing:
+            url = _ONNX_MODEL_SOURCE.format(
+                model_name=model_name, filename=filename
+            )
+            logger.info("Downloading ONNX model file %s from %s", filename, url)
+            stream_download(url, os.path.join(target, filename), None)
+
+    remaining = _onnx_model_missing_files(model_dir, model_name)
+    if remaining:
+        target = os.path.join(
+            model_dir, model_directory_name(model_name, "onnxruntime")
+        )
+        raise FileNotFoundError(
+            f"ONNX model {model_name!r} is missing {', '.join(remaining)} under "
+            f"{target!r}."
+        )
 
 
 def make_sure_model_exists(model_dir: str, model_name: str) -> None:

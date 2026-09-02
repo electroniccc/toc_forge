@@ -44,7 +44,9 @@ from .parsing import (
 from .utils import (
     _roman_to_int,
     compute_file_hash,
+    make_sure_onnx_model_exists,
     make_sure_model_exists,
+    model_directory_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -221,8 +223,15 @@ def bookmark_pdf(
     pdf_hash = compute_file_hash(input) if cache_dir else None
     doc = pymupdf.open(input)
 
+    def _ensure_model(model_name: str) -> str:
+        if engine and engine.strip().lower() == "onnxruntime":
+            make_sure_onnx_model_exists(model_dir, model_name)
+        else:
+            make_sure_model_exists(model_dir, model_name)
+        return os.path.join(model_dir, model_directory_name(model_name, engine))
+
     layout_detection_model = "PP-DocLayout_plus-L"
-    make_sure_model_exists(model_dir, layout_detection_model)
+    layout_detection_model_dir = _ensure_model(layout_detection_model)
 
     # 引擎行为只在被显式指定时才传入，None 保持 PaddleX 默认：
     # - engine: 如 "onnxruntime" 时使用模型目录下的 inference.onnx 推理，
@@ -242,7 +251,7 @@ def bookmark_pdf(
         _engine_kwargs["enable_mkldnn"] = enable_mkldnn
     layout_model = LayoutDetection(
         model_name=layout_detection_model,
-        model_dir=os.path.join(model_dir, layout_detection_model),
+        model_dir=layout_detection_model_dir,
         device=device,
         **_engine_kwargs,
     )
@@ -276,7 +285,7 @@ def bookmark_pdf(
     logger.debug(f"number_pages: {number_pages}")
 
     doc_ori_classify_model = "PP-LCNet_x1_0_doc_ori"
-    make_sure_model_exists(model_dir, doc_ori_classify_model)
+    doc_ori_classify_model_dir = _ensure_model(doc_ori_classify_model)
     # OCR 模型规格：server（默认，精度高）或 mobile（CPU 上快一个量级，
     # GUI 打包版只有 CPU 可用，用 mobile 控制耗时）
     if ocr_model_size == "mobile":
@@ -285,8 +294,8 @@ def bookmark_pdf(
     else:
         text_detection_model = "PP-OCRv5_server_det"
         text_recognition_model = "PP-OCRv5_server_rec"
-    make_sure_model_exists(model_dir, text_detection_model)
-    make_sure_model_exists(model_dir, text_recognition_model)
+    text_detection_model_dir = _ensure_model(text_detection_model)
+    text_recognition_model_dir = _ensure_model(text_recognition_model)
 
     # 无论哪种策略都创建 OCR 模型：llm/local_ocr 用它做目录 OCR，
     # 页码扫描（get_page_offset2）也需要它，vllm 策略同样需要。
@@ -294,14 +303,12 @@ def bookmark_pdf(
         use_doc_orientation_classify=True,
         use_doc_unwarping=False,
         use_textline_orientation=False,
-        doc_orientation_classify_model_dir=os.path.join(
-            model_dir, doc_ori_classify_model
-        ),
+        doc_orientation_classify_model_dir=doc_ori_classify_model_dir,
         doc_orientation_classify_model_name=doc_ori_classify_model,
         text_detection_model_name=text_detection_model,
-        text_detection_model_dir=os.path.join(model_dir, text_detection_model),
+        text_detection_model_dir=text_detection_model_dir,
         text_recognition_model_name=text_recognition_model,
-        text_recognition_model_dir=os.path.join(model_dir, text_recognition_model),
+        text_recognition_model_dir=text_recognition_model_dir,
         device=device,
         **_engine_kwargs,
     )

@@ -8,6 +8,8 @@ from unittest.mock import patch
 import requests
 
 from toc_forge import gui_support
+from toc_forge import utils
+from toc_forge.utils import make_sure_onnx_model_exists, model_directory_name
 
 
 class _IncompleteResponse:
@@ -27,6 +29,23 @@ class _IncompleteResponse:
         yield b"short"
 
 
+class _CompleteResponse:
+    headers = {"content-length": "4"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def raise_for_status(self):
+        return None
+
+    def iter_content(self, chunk_size=65536):
+        del chunk_size
+        yield b"data"
+
+
 class DownloadTests(unittest.TestCase):
     def test_incomplete_download_does_not_replace_an_existing_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -34,7 +53,7 @@ class DownloadTests(unittest.TestCase):
             Path(dst).write_bytes(b"known-good")
 
             with (
-                patch.object(gui_support.requests, "get", return_value=_IncompleteResponse()),
+                patch.object(utils.requests, "get", return_value=_IncompleteResponse()),
                 self.assertRaises(requests.ConnectionError),
             ):
                 gui_support.stream_download("https://example.invalid/model", dst, None, retries=1)
@@ -45,7 +64,7 @@ class DownloadTests(unittest.TestCase):
     def test_model_requires_both_nontrivial_onnx_and_yaml_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             for name in gui_support.MODEL_NAMES:
-                target = Path(tmp, name)
+                target = Path(tmp, gui_support.onnx_model_dir_name(name))
                 target.mkdir()
                 with open(target / "inference.onnx", "wb") as f:
                     f.truncate(1_100_000)
@@ -53,11 +72,40 @@ class DownloadTests(unittest.TestCase):
             self.assertFalse(gui_support.all_models_exist(tmp))
 
             for name in gui_support.MODEL_NAMES:
-                Path(tmp, name, "inference.yml").write_text(
+                Path(tmp, gui_support.onnx_model_dir_name(name), "inference.yml").write_text(
                     "Global:\n  model_name: regression-test\n", encoding="utf-8"
                 )
 
             self.assertTrue(gui_support.all_models_exist(tmp))
+
+    def test_onnx_models_use_a_separate_directory_name(self):
+        name = "PP-OCRv5_server_det"
+
+        self.assertEqual(gui_support.onnx_model_dir_name(name), f"{name}_onnx")
+        self.assertEqual(model_directory_name(name, "onnxruntime"), f"{name}_onnx")
+        self.assertEqual(model_directory_name(name, "paddle"), name)
+        self.assertEqual(model_directory_name(name, None), name)
+
+    def test_cli_downloads_onnx_files_to_the_isolated_directory(self):
+        name = "PP-OCRv5_server_det"
+        with tempfile.TemporaryDirectory() as tmp:
+            # A legacy mixed directory must not be treated as the ONNX cache.
+            old_dir = Path(tmp, name)
+            old_dir.mkdir()
+            (old_dir / "inference.onnx").write_bytes(b"old")
+
+            with patch.object(
+                utils.requests,
+                "get",
+                side_effect=[_CompleteResponse(), _CompleteResponse()],
+            ) as get:
+                make_sure_onnx_model_exists(tmp, name)
+
+            target = Path(tmp, f"{name}_onnx")
+            self.assertEqual((target / "inference.yml").read_bytes(), b"data")
+            self.assertEqual((target / "inference.onnx").read_bytes(), b"data")
+            self.assertEqual((old_dir / "inference.onnx").read_bytes(), b"old")
+            self.assertEqual(get.call_count, 2)
 
 
 class GuiPathTests(unittest.TestCase):
@@ -85,9 +133,10 @@ class PackagingTests(unittest.TestCase):
     def test_gui_optional_dependencies_are_declared(self):
         with open("pyproject.toml", "rb") as f:
             project = tomllib.load(f)["project"]
+        dependencies = " ".join(project["dependencies"]).lower()
         gui_dependencies = " ".join(project["optional-dependencies"]["gui"]).lower()
 
-        self.assertIn("requests", gui_dependencies)
+        self.assertIn("requests", dependencies)
         self.assertIn("sv-ttk", gui_dependencies)
         self.assertIn("onnxruntime", gui_dependencies)
 

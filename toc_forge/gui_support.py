@@ -5,12 +5,11 @@ import json
 import os
 import sys
 import tempfile
-import time
 from collections import Counter
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-import requests
+from .utils import model_directory_name, stream_download
 
 MODEL_NAMES = (
     "PP-DocLayout_plus-L",
@@ -24,9 +23,14 @@ _MIN_ONNX_BYTES = 1_000_000
 _MIN_YAML_BYTES = 16
 
 
+def onnx_model_dir_name(model_name: str) -> str:
+    """Return the isolated local directory name for an ONNX model."""
+    return model_directory_name(model_name, "onnxruntime")
+
+
 def model_is_complete(model_dir: str, model_name: str) -> bool:
     """Return whether an ONNX model has both non-trivial required files."""
-    target = Path(model_dir, model_name)
+    target = Path(model_dir, onnx_model_dir_name(model_name))
     onnx_path = target / "inference.onnx"
     yaml_path = target / "inference.yml"
     try:
@@ -42,60 +46,6 @@ def model_is_complete(model_dir: str, model_name: str) -> bool:
 
 def all_models_exist(model_dir: str) -> bool:
     return all(model_is_complete(model_dir, name) for name in MODEL_NAMES)
-
-
-def stream_download(
-    url: str,
-    dst: str,
-    progress_cb: Callable[[float], None] | None,
-    retries: int = 3,
-) -> None:
-    """Download to ``dst.part`` and atomically replace ``dst`` on success."""
-    destination = os.path.abspath(dst)
-    os.makedirs(os.path.dirname(destination), exist_ok=True)
-    part_path = destination + ".part"
-    last_err: Exception | None = None
-
-    for attempt in range(retries):
-        try:
-            with requests.get(url, stream=True, timeout=30) as response:
-                response.raise_for_status()
-                total = int(response.headers.get("content-length", 0))
-                downloaded = 0
-                with open(part_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=65536):
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if progress_cb and total:
-                            progress_cb(downloaded / total)
-                    f.flush()
-                    os.fsync(f.fileno())
-                if downloaded == 0 or (total and downloaded != total):
-                    raise requests.ConnectionError(
-                        f"incomplete download: {downloaded} of {total} bytes"
-                    )
-            os.replace(part_path, destination)
-            return
-        except (requests.RequestException, OSError) as exc:
-            try:
-                os.unlink(part_path)
-            except FileNotFoundError:
-                pass
-            if (
-                isinstance(exc, requests.HTTPError)
-                and exc.response is not None
-                and 400 <= exc.response.status_code < 500
-            ):
-                raise
-            last_err = exc
-            if attempt < retries - 1:
-                time.sleep(1.0 + attempt)
-
-    raise requests.ConnectionError(
-        f"download failed after {retries} attempts: {last_err}"
-    )
 
 
 def default_settings_path() -> str:

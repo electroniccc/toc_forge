@@ -241,7 +241,7 @@ def _download_model_files(model_dir: str, model_name: str, source: str, progress
     """ModelScope / HuggingFace 源：从 {name}_onnx 仓库逐文件下载 onnx 推理文件。"""
     template = _MODEL_SOURCES[source]
     n = len(_MODEL_FILES)
-    target = os.path.join(model_dir, model_name)
+    target = os.path.join(model_dir, onnx_model_dir_name(model_name))
     os.makedirs(target, exist_ok=True)
 
     for i, fname in enumerate(_MODEL_FILES):
@@ -259,9 +259,7 @@ def _download_model_files(model_dir: str, model_name: str, source: str, progress
 
 
 def _download_model(model_dir: str, model_name: str, source: str = "modelscope", progress_cb: Callable[[str, float], None] | None = None) -> None:
-    target = os.path.join(model_dir, model_name)
-    # 存在性以 inference.onnx 为准：onnxruntime 引擎只认 onnx 文件，
-    # 旧的 paddle 格式目录（无 onnx）会被重新下载补全
+    # ONNX 文件放在 {name}_onnx，与 Paddle 格式的 {name} 目录完全隔离。
     if model_is_complete(model_dir, model_name):
         if progress_cb:
             progress_cb(t("dl_exists", name=model_name), 1.0)

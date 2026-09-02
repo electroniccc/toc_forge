@@ -17,11 +17,11 @@ dependencies = [
     "numpy",
     "scikit-learn",
     "openai",
+    "requests",
 ]
 
 [project.optional-dependencies]
 gui = [
-    "requests",
     "sv-ttk",
     "onnxruntime>=1.27,<1.28",
 ]

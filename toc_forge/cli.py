@@ -68,7 +68,8 @@ def main() -> None:
         default=None,
         help="inference engine for PaddleOCR models: 'paddle', 'paddle_static', "
         "'paddle_dynamic', 'onnxruntime', etc. (default: PaddleX auto). "
-        "With 'onnxruntime', place an inference.onnx in each model directory.",
+        "With 'onnxruntime', ONNX files are automatically downloaded under "
+        "{model_name}_onnx for each model.",
     )
     parser.add_argument(
         "--disable_mkldnn",
