@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import requests
 
+import gui_app
 from toc_forge import gui_support
 from toc_forge import utils
 from toc_forge.utils import make_sure_onnx_model_exists, model_directory_name
@@ -47,6 +48,20 @@ class _CompleteResponse:
 
 
 class DownloadTests(unittest.TestCase):
+    def test_gui_download_uses_the_isolated_onnx_model_directory(self):
+        name = "PP-OCRv5_mobile_det"
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            gui_app, "_stream_download"
+        ) as download:
+            gui_app._download_model_files(tmp, name, "modelscope", None)
+
+        destinations = [Path(call.args[1]) for call in download.call_args_list]
+        expected_dir = Path(tmp, gui_support.onnx_model_dir_name(name))
+        self.assertEqual(
+            destinations,
+            [expected_dir / filename for filename in gui_support.MODEL_FILES],
+        )
+
     def test_incomplete_download_does_not_replace_an_existing_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             dst = os.path.join(tmp, "inference.onnx")

@@ -18,6 +18,7 @@ from toc_forge.gui_support import (
     default_settings_path,
     load_settings,
     model_is_complete,
+    onnx_model_dir_name,
     plan_output_names,
     save_settings,
     stream_download as _stream_download,
