@@ -5,8 +5,30 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "toc-forge"
 version = "0.3.0"
-description = "Extract table of contents from PDFs and inject navigable bookmarks"
+description = "Automatically convert PDF table-of-contents pages into clickable bookmarks using OCR or optional LLMs"
+readme = "README.md"
 requires-python = ">=3.10"
+keywords = [
+    "pdf",
+    "pdf-bookmarks",
+    "pdf-outline",
+    "table-of-contents",
+    "ocr",
+    "paddleocr",
+    "scanned-pdf",
+    "ebook",
+    "document-ai",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics :: Capture :: Scanners",
+    "Topic :: Text Processing :: General",
+]
 dependencies = [
     "paddlepaddle",
     "paddleocr",
@@ -25,6 +47,16 @@ gui = [
     "sv-ttk",
     "onnxruntime>=1.27,<1.28",
 ]
+web = [
+    "fastapi",
+    "uvicorn",
+    "python-multipart",
+]
+
+[project.urls]
+Homepage = "https://github.com/electroniccc/toc_forge"
+Repository = "https://github.com/electroniccc/toc_forge"
+Issues = "https://github.com/electroniccc/toc_forge/issues"
 
 [project.scripts]
 toc-forge = "toc_forge.cli:main"
