@@ -7,13 +7,14 @@ import re
 import statistics
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pymupdf
 from paddleocr import LayoutDetection, PaddleOCR
 
 from .errors import EmptyTocError, TocNotFoundError
-from .llm import build_toc_llm, build_toc_vllm
+from .llm import LlmUsage, build_toc_llm, build_toc_vllm
 from .ocr_engine import (
     DEFAULT_TOC_DETECT_MAX_PAGE,
     compute_page_offset,
@@ -50,6 +51,17 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class BookmarkResult:
+    """Named result returned by :func:`bookmark_pdf`."""
+
+    pdf_bookmarks_path: str
+    time_cost: float
+    toc_tree: list[dict]
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 def build_toc_local_ocr(
@@ -218,10 +230,11 @@ def bookmark_pdf(
     ocr_model_size: str = "server",
     toc_detect_max_page: int | None = None,
     output_filename: str | None = None,
-) -> tuple[str, float, dict]:
+) -> BookmarkResult:
     start_time = time.perf_counter()
     pdf_hash = compute_file_hash(input) if cache_dir else None
     doc = pymupdf.open(input)
+    llm_usage = LlmUsage()
 
     def _ensure_model(model_name: str) -> str:
         if engine and engine.strip().lower() == "onnxruntime":
@@ -385,7 +398,7 @@ def bookmark_pdf(
     gc.collect()
 
     if toc_strategy == "vllm":
-        toc_tree1 = build_toc_vllm(
+        llm_result = build_toc_vllm(
             toc_pages,
             page_imgs,
             do_debug=do_debug,
@@ -398,8 +411,10 @@ def bookmark_pdf(
             llm_base_url=api_base_url,
             llm_timeout=llm_timeout,
         )
+        toc_tree1 = llm_result.toc_tree
+        llm_usage = llm_result.usage
     elif toc_strategy == "llm":
-        toc_tree1 = build_toc_llm(
+        llm_result = build_toc_llm(
             toc_pages,
             page_imgs,
             ocr_model,
@@ -413,6 +428,8 @@ def bookmark_pdf(
             no_toc_cache=no_toc_cache,
             llm_timeout=llm_timeout,
         )
+        toc_tree1 = llm_result.toc_tree
+        llm_usage = llm_result.usage
     else:
         toc_tree1 = build_toc_local_ocr(
             toc_pages,
@@ -563,4 +580,10 @@ def bookmark_pdf(
     time_cost = end_time - start_time
     logger.debug(f"process {Path(input).stem} cost: {time_cost:.2f} seconds")
     doc.close()
-    return pdf_bookmarks_path, time_cost, toc_tree1
+    return BookmarkResult(
+        pdf_bookmarks_path,
+        time_cost,
+        toc_tree1,
+        llm_usage.input_tokens,
+        llm_usage.output_tokens,
+    )

@@ -127,7 +127,7 @@ def main() -> None:
     logger.info("toc_strategy=%s", toc_strategy)
 
     try:
-        pdf_bookmarks_path, time_cost, _ = bookmark_pdf(
+        result = bookmark_pdf(
             args.input,
             args.output,
             args.model_dir,
@@ -150,6 +150,6 @@ def main() -> None:
         print(f"toc-forge: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
     print(
-        f"Bookmarked PDF saved to: {pdf_bookmarks_path}, "
-        f"Time elapsed: {format_duration(time_cost)}"
+        f"Bookmarked PDF saved to: {result.pdf_bookmarks_path}, "
+        f"Time elapsed: {format_duration(result.time_cost)}"
     )

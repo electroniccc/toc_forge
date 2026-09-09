@@ -160,7 +160,9 @@ class ParameterExposureTests(unittest.TestCase):
     def test_cli_passes_toc_detect_max_page_through(self):
         from toc_forge import cli
 
-        mock = Mock(return_value=("out.pdf", 1.0, {}))
+        from toc_forge.pipeline import BookmarkResult
+
+        mock = Mock(return_value=BookmarkResult("out.pdf", 1.0, []))
         with (
             patch.object(cli, "bookmark_pdf", mock),
             patch.object(
@@ -176,7 +178,9 @@ class ParameterExposureTests(unittest.TestCase):
     def test_cli_defaults_toc_detect_max_page_to_none(self):
         from toc_forge import cli
 
-        mock = Mock(return_value=("out.pdf", 1.0, {}))
+        from toc_forge.pipeline import BookmarkResult
+
+        mock = Mock(return_value=BookmarkResult("out.pdf", 1.0, []))
         with (
             patch.object(cli, "bookmark_pdf", mock),
             patch.object(sys, "argv", ["toc-forge", "--input", "x.pdf"]),

@@ -7,6 +7,7 @@ from toc_forge.llm import (
     _TOC_LLM_SYSTEM_PROMPT,
     _TOC_VLLM_SYSTEM_PROMPT,
     _build_llm_client,
+    _call_llm,
     _load_toc_tree_cache,
     _save_toc_tree_cache,
     _simplify_ocr_for_llm,
@@ -18,6 +19,31 @@ from toc_forge.utils import _cache_load, _cache_save
 
 
 class LlmInputTests(unittest.TestCase):
+    def test_call_returns_input_and_output_token_usage(self):
+        class Completions:
+            def create(self, **_kwargs):
+                class Response:
+                    usage = type("Usage", (), {
+                        "prompt_tokens": 123,
+                        "completion_tokens": 17,
+                    })()
+                    choices = [
+                        type("Choice", (), {
+                            "message": type("Message", (), {"content": '{"toc": []}'})()
+                        })()
+                    ]
+
+                return Response()
+
+        client = type("Client", (), {
+            "chat": type("Chat", (), {"completions": Completions()})()
+        })()
+        parsed, usage = _call_llm(client, "model", "system", "input")
+
+        self.assertEqual(parsed, {"toc": []})
+        self.assertEqual(usage.input_tokens, 123)
+        self.assertEqual(usage.output_tokens, 17)
+
     def test_prompts_split_compact_multientry_rows_in_any_language(self):
         for prompt in (_TOC_LLM_SYSTEM_PROMPT, _TOC_VLLM_SYSTEM_PROMPT):
             self.assertIn("separate sibling nodes", prompt)

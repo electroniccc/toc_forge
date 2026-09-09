@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 import toc_forge
+from toc_forge.pipeline import BookmarkResult
 
 logger = logging.getLogger("web_app")
 
@@ -28,7 +29,7 @@ def _run_bookmark(
     toc_strategy: str,
     api_base_url: str | None,
     api_key: str | None,
-) -> tuple[str, float]:
+) -> BookmarkResult:
     return toc_forge.bookmark_pdf(
         input=input_path,
         output=output_dir,
@@ -69,17 +70,17 @@ async def bookmark_pdf(
             file.filename, os.path.getsize(input_path), toc_strategy,
         )
         loop = asyncio.get_running_loop()
-        pdf_path, elapsed, _ = await loop.run_in_executor(
+        result = await loop.run_in_executor(
             None, _run_bookmark, input_path, output_dir, toc_strategy, api_base_url, api_key,
         )
-        logger.info("Done %s in %.1fs", file.filename, elapsed)
+        logger.info("Done %s in %.1fs", file.filename, result.time_cost)
 
-        if not pdf_path or not os.path.exists(pdf_path):
+        if not result.pdf_bookmarks_path or not os.path.exists(result.pdf_bookmarks_path):
             raise HTTPException(500, "Bookmark generation failed")
 
         stem = Path(file.filename).stem
         return FileResponse(
-            pdf_path,
+            result.pdf_bookmarks_path,
             media_type="application/pdf",
             filename=f"{stem}_bookmarked.pdf",
             background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),

@@ -805,7 +805,7 @@ class TocForgeApp:
                 results = []
                 for pdf_path, output_name in zip(pdf_paths, output_names):
                     try:
-                        pdf_out, elapsed, _ = toc_forge.bookmark_pdf(
+                        result = toc_forge.bookmark_pdf(
                             input=pdf_path,
                             output=output_dir,
                             model_dir=model_dir,
@@ -834,7 +834,7 @@ class TocForgeApp:
                         )
                     except Exception as exc:
                         raise RuntimeError(f"{os.path.basename(pdf_path)}: {exc}") from exc
-                    results.append((pdf_out, elapsed))
+                    results.append((result.pdf_bookmarks_path, result.time_cost))
                 total = len(pdf_paths)
                 self.root.after(0, lambda: self._on_done(results, total))
             except Exception as exc:

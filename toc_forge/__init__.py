@@ -15,7 +15,7 @@ if sys.stderr is None:
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from .pipeline import bookmark_pdf  # noqa: E402
+from .pipeline import BookmarkResult, bookmark_pdf  # noqa: E402
 from .cli import main  # noqa: E402
 from .errors import EmptyTocError, TocForgeError, TocNotFoundError  # noqa: E402
 from .utils import setup_logger, make_sure_model_exists  # noqa: E402

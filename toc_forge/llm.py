@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 
 import cv2
 import httpx
@@ -14,6 +15,23 @@ from .ocr_engine import ocr_toc_pages
 from .utils import _cache_load, _cache_path, _cache_save
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class LlmUsage:
+    """Token usage reported by one LLM request."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class LlmBuildResult:
+    """Internal TOC result plus the usage of its optional LLM request."""
+
+    toc_tree: list[dict]
+    usage: LlmUsage = LlmUsage()
+
 
 _TOC_LLM_SYSTEM_PROMPT = (
     "You are a table-of-contents parser for any document (book, textbook, thesis, "
@@ -147,7 +165,7 @@ def _call_llm(
     model: str,
     system_prompt: str,
     user_content: str | list[dict],
-) -> dict | list:
+) -> tuple[dict | list, LlmUsage]:
     logger.info("Calling LLM model=%s ...", model)
     try:
         response = client.chat.completions.create(
@@ -159,13 +177,29 @@ def _call_llm(
             temperature=0.0,
             extra_body={"enable_thinking": False},
         )
+        response_usage = getattr(response, "usage", None)
+        usage = LlmUsage(
+            input_tokens=int(
+                getattr(response_usage, "prompt_tokens", None)
+                or getattr(response_usage, "input_tokens", 0)
+                or 0
+            ),
+            output_tokens=int(
+                getattr(response_usage, "completion_tokens", None)
+                or getattr(response_usage, "output_tokens", 0)
+                or 0
+            ),
+        )
         raw = response.choices[0].message.content
-        logger.info("LLM response length=%d, preview=%s", len(raw), raw[:200])
+        logger.info(
+            "LLM response length=%d, input_tokens=%d, output_tokens=%d, preview=%s",
+            len(raw), usage.input_tokens, usage.output_tokens, raw[:200],
+        )
         # Strip markdown fences if present
         m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", raw, re.DOTALL)
         if m:
             raw = m.group(1).strip()
-        return json.loads(raw)
+        return json.loads(raw), usage
     except Exception as e:
         logger.warning("LLM call failed: %s", e)
         raise
@@ -427,7 +461,7 @@ def build_toc_llm(
     llm_api_key: str | None = None,
     no_toc_cache: bool = False,
     llm_timeout: float = 600.0,
-) -> list[dict]:
+) -> LlmBuildResult:
     """Run local OCR then call a text LLM to build the TOC tree.
 
     The resulting tree is cached as ``toc_tree_llm.json`` per document; a
@@ -441,7 +475,7 @@ def build_toc_llm(
     if not no_toc_cache:
         cached = _load_toc_tree_cache(cache_dir, pdf_hash, "llm")
         if cached is not None:
-            return _sanitize_toc_tree(cached)
+            return LlmBuildResult(_sanitize_toc_tree(cached))
 
     toc_results = ocr_toc_pages(
         toc_pages,
@@ -470,7 +504,7 @@ def build_toc_llm(
         base_url=llm_base_url, api_key=llm_api_key,
         timeout=llm_timeout,
     )
-    result = _call_llm(
+    result, usage = _call_llm(
         client,
         llm_model,
         _TOC_LLM_SYSTEM_PROMPT,
@@ -481,7 +515,7 @@ def build_toc_llm(
     toc_tree = result.get("toc", []) if isinstance(result, dict) else result
     toc_tree = _sanitize_toc_tree(toc_tree)
     _save_toc_tree_cache(cache_dir, pdf_hash, "llm", toc_tree)
-    return toc_tree
+    return LlmBuildResult(toc_tree, usage)
 
 
 def build_toc_vllm(
@@ -496,7 +530,7 @@ def build_toc_vllm(
     pdf_hash: str | None = None,
     no_toc_cache: bool = False,
     llm_timeout: float = 600.0,
-) -> list[dict]:
+) -> LlmBuildResult:
     """Build TOC by sending page images to a vision LLM, skipping local OCR.
 
     The resulting tree is cached as ``toc_tree_vllm.json`` per document; a
@@ -510,7 +544,7 @@ def build_toc_vllm(
     if not no_toc_cache:
         cached = _load_toc_tree_cache(cache_dir, pdf_hash, "vllm")
         if cached is not None:
-            return _sanitize_toc_tree(cached)
+            return LlmBuildResult(_sanitize_toc_tree(cached))
 
     client = _build_llm_client(
         base_url=llm_base_url, api_key=llm_api_key,
@@ -534,10 +568,10 @@ def build_toc_vllm(
             "text": 'Return a JSON object like: {"toc": [{"title": "...", "page_num": 1, "children": [...]}, ...]}',
         }
     )
-    result = _call_llm(
+    result, usage = _call_llm(
         client, llm_model, _TOC_VLLM_SYSTEM_PROMPT, content,
     )
     toc_tree = result.get("toc", []) if isinstance(result, dict) else result
     toc_tree = _sanitize_toc_tree(toc_tree)
     _save_toc_tree_cache(cache_dir, pdf_hash, "vllm", toc_tree)
-    return toc_tree
+    return LlmBuildResult(toc_tree, usage)
