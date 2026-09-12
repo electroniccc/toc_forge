@@ -38,7 +38,7 @@ TOC Forge 不会根据全文凭空生成目录。输入 PDF 必须已经包含�
 
 ## 环境要求
 
-- Python 3.10 或更高版本
+- Python 3.12 或更高版本
 - Windows 或 Linux；打包版桌面工作流主要面向 Windows
 - 第一次运行需要联网下载 PaddleOCR/PaddleX 模型
 - 只有使用文本 LLM 或视觉 LLM 时才需要 API Key

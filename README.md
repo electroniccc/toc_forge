@@ -40,7 +40,7 @@ TOC Forge does not generate a table of contents from the document body. The inpu
 
 ## Requirements
 
-- Python 3.10 or later
+- Python 3.12 or later
 - Windows or Linux; the packaged desktop workflow is designed for Windows
 - Internet access on the first run to download PaddleOCR/PaddleX models
 - An API key only when using text-LLM or vision-LLM mode

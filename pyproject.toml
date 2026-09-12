@@ -7,7 +7,7 @@ name = "toc-forge"
 version = "0.3.0"
 description = "Automatically convert PDF table-of-contents pages into clickable bookmarks using OCR or optional LLMs"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 keywords = [
     "pdf",
     "pdf-bookmarks",
@@ -23,8 +23,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Multimedia :: Graphics :: Capture :: Scanners",
     "Topic :: Text Processing :: General",
@@ -72,6 +70,15 @@ toc-forge = "toc_forge.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "paddle-gpu" },
+        { extra = "onnx-gpu" },
+        { extra = "onnx-cpu" },
+    ],
+]
 
 [tool.vercel]
 entrypoint = "vercel_app:app"
