@@ -40,6 +40,8 @@ def _run_bookmark(
         api_key=api_key,
         llm_name=_cfg["llm_name"],
         vllm_name=_cfg["vllm_name"],
+        engine=_cfg["engine"],
+        device=_cfg["device"],
     )
 
 
@@ -107,6 +109,18 @@ def main() -> None:
     parser.add_argument("--model_dir", type=str, default="./models")
     parser.add_argument("--cache_dir", type=str, default="./.ocr_cache")
     parser.add_argument("--log_dir", type=str, default="log")
+    parser.add_argument(
+        "--engine",
+        type=str,
+        default="onnxruntime",
+        help="inference engine passed to PaddleOCR (default: onnxruntime)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help="inference device passed to PaddleOCR, e.g. cpu, gpu, or gpu:0 (default: cpu)",
+    )
     args = parser.parse_args()
 
     toc_forge.setup_logger(args.log_dir)
@@ -117,11 +131,13 @@ def main() -> None:
         cache_dir=args.cache_dir,
         llm_name=os.environ.get("OPENAI_MODEL", "deepseek-v4-flash"),
         vllm_name=os.environ.get("VLLM_MODEL", "qwen3.6-35b-a3b"),
+        engine=args.engine,
+        device=args.device,
     )
 
     logger.info(
-        "Starting server on %s:%d (model_dir=%s, cache_dir=%s)",
-        args.host, args.port, args.model_dir, args.cache_dir,
+        "Starting server on %s:%d (model_dir=%s, cache_dir=%s, engine=%s, device=%s)",
+        args.host, args.port, args.model_dir, args.cache_dir, args.engine, args.device,
     )
 
     host_render = "127.0.0.1" if args.host == "0.0.0.0" else args.host

@@ -149,11 +149,13 @@ Choose a PDF, select an output directory, and click **Download / Verify Models**
 ## Local Web UI
 
 ```bash
-uv pip install ".[web]"
-python web_app.py
+uv pip install ".[web,onnx-cpu]"
+python web_app.py  # defaults: --engine onnxruntime --device cpu
 ```
 
 The browser opens at `http://127.0.0.1:8000`. Uploaded files are processed locally by the running server.
+To use another installed runtime, pass `--engine` and `--device`, for example
+`python web_app.py --engine onnxruntime --device gpu`.
 
 ## Useful CLI options
 

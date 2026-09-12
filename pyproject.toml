@@ -30,7 +30,6 @@ classifiers = [
     "Topic :: Text Processing :: General",
 ]
 dependencies = [
-    "paddlepaddle",
     "paddleocr",
     "paddlex[ocr]",
     "opencv-python",
@@ -43,9 +42,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Select exactly one inference-runtime extra when installing the package.  The
+# CPU ONNX Runtime variant is the default/recommended installation target.
+paddle-gpu = [
+    "paddlepaddle-gpu",
+]
+onnx-gpu = [
+    "onnxruntime-gpu>=1.27,<1.28",
+]
+onnx-cpu = [
+    "onnxruntime>=1.27,<1.28",
+]
 gui = [
     "sv-ttk",
-    "onnxruntime>=1.27,<1.28",
 ]
 web = [
     "fastapi",

@@ -153,7 +153,14 @@ class PackagingTests(unittest.TestCase):
 
         self.assertIn("requests", dependencies)
         self.assertIn("sv-ttk", gui_dependencies)
-        self.assertIn("onnxruntime", gui_dependencies)
+
+    def test_inference_runtime_extras_are_declared(self):
+        with open("pyproject.toml", "rb") as f:
+            extras = tomllib.load(f)["project"]["optional-dependencies"]
+
+        self.assertIn("paddlepaddle-gpu", " ".join(extras["paddle-gpu"]).lower())
+        self.assertIn("onnxruntime-gpu", " ".join(extras["onnx-gpu"]).lower())
+        self.assertIn("onnxruntime", " ".join(extras["onnx-cpu"]).lower())
 
 
 if __name__ == "__main__":

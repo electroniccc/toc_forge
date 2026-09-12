@@ -147,11 +147,13 @@ python .\gui_app.py
 ## 本地 Web UI
 
 ```bash
-uv pip install ".[web]"
-python web_app.py
+uv pip install ".[web,onnx-cpu]"
+python web_app.py  # 默认：--engine onnxruntime --device cpu
 ```
 
 浏览器会打开 `http://127.0.0.1:8000`，上传的文件由本机启动的服务处理。
+如需使用其他已安装的运行时，可通过 `--engine` 和 `--device` 指定，例如
+`python web_app.py --engine onnxruntime --device gpu`。
 
 ## 常用命令行参数
 
