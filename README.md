@@ -72,10 +72,10 @@ source .venv/bin/activate
 Install the CLI:
 
 ```bash
-uv pip install .
+uv pip install ".[onnx-cpu]"
 ```
 
-You can use `pip install .` instead if you do not use `uv`.
+This installs the recommended ONNX Runtime CPU extra. To select another inference runtime, install one of `.[onnx-gpu]` or `.[paddle-gpu]` instead. Without `uv`, use `pip install ".[onnx-cpu]"`.
 
 ## Quick start: local OCR
 
@@ -156,6 +156,18 @@ python web_app.py  # defaults: --engine onnxruntime --device cpu
 The browser opens at `http://127.0.0.1:8000`. Uploaded files are processed locally by the running server.
 To use another installed runtime, pass `--engine` and `--device`, for example
 `python web_app.py --engine onnxruntime --device gpu`.
+
+### Deploy to Vercel
+
+Install and sign in to the Vercel CLI, link this repository once with `vercel link`, then use Bash on Linux, macOS, or WSL:
+
+```bash
+bash ./deploy_vercel.sh       # preview deployment
+bash ./deploy_vercel.sh --prod
+```
+
+The Vercel entrypoint uses ONNX Runtime on CPU with mobile text-recognition models. Model files are downloaded on first use into the function's temporary storage and may need to be downloaded again after a cold start. Vercel Functions limit both request and response bodies to 4.5 MB, so this deployment only supports PDFs whose upload and bookmarked output both fit under that limit.
+The deployment script temporarily generates a Linux CPU `requirements.txt` from `pyproject.toml` and removes it after deployment; the repository does not keep a frozen requirements file.
 
 ## Useful CLI options
 

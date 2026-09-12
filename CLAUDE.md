@@ -14,15 +14,16 @@ Source the env script before running:
 ```
 This sets `PADDLE_HUB_HOME`, `PADDLE_PDX_CACHE_HOME`, and disables model source checks. The script checks for `PADDLE_PDX_CACHE_HOME` at startup and refuses to run without it.
 
-The project uses a local `.venv`. Install in editable mode:
+The project uses a local `.venv`. Install in editable mode with the ONNX CPU runtime (recommended):
 ```powershell
-pip install -e .
+uv pip install -e ".[onnx-cpu]"
 ```
+Choose exactly one runtime extra for other backends: `.[onnx-gpu]` or `.[paddle-gpu]`. The dependency groups are maintained in `pyproject.toml`; there is no checked-in `requirements.txt`.
 Key dependencies: `paddleocr`, `paddlex`, `opencv-python` (cv2), `PyMuPDF` (fitz), `Pillow`, `numpy`, `scikit-learn`, `openai`.
 
 ## Running
 
-After `pip install -e .`:
+After installing the package and the runtime extra matching your chosen engine:
 ```powershell
 toc-forge --input <pdf_path> --output <output_dir> [--model_dir ./models] [--debug]
 ```

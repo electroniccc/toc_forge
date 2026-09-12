@@ -42,6 +42,7 @@ def _run_bookmark(
         vllm_name=_cfg["vllm_name"],
         engine=_cfg["engine"],
         device=_cfg["device"],
+        ocr_model_size=_cfg["ocr_model_size"],
     )
 
 
@@ -121,6 +122,12 @@ def main() -> None:
         default="cpu",
         help="inference device passed to PaddleOCR, e.g. cpu, gpu, or gpu:0 (default: cpu)",
     )
+    parser.add_argument(
+        "--ocr_model_size",
+        choices=("server", "mobile"),
+        default="server",
+        help="OCR model size: server (default) or mobile",
+    )
     args = parser.parse_args()
 
     toc_forge.setup_logger(args.log_dir)
@@ -133,6 +140,7 @@ def main() -> None:
         vllm_name=os.environ.get("VLLM_MODEL", "qwen3.6-35b-a3b"),
         engine=args.engine,
         device=args.device,
+        ocr_model_size=args.ocr_model_size,
     )
 
     logger.info(

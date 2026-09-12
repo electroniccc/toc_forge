@@ -72,3 +72,6 @@ toc-forge = "toc_forge.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.vercel]
+entrypoint = "vercel_app:app"

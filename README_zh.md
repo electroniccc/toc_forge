@@ -70,10 +70,10 @@ source .venv/bin/activate
 安装命令行工具：
 
 ```bash
-uv pip install .
+uv pip install ".[onnx-cpu]"
 ```
 
-如果不使用 `uv`，也可以执行 `pip install .`。
+这会安装推荐的 ONNX Runtime CPU 依赖。需要其他推理运行时时，改用 `.[onnx-gpu]` 或 `.[paddle-gpu]`。不使用 `uv` 时可执行 `pip install ".[onnx-cpu]"`。
 
 ## 快速开始：纯本地 OCR
 
@@ -154,6 +154,18 @@ python web_app.py  # 默认：--engine onnxruntime --device cpu
 浏览器会打开 `http://127.0.0.1:8000`，上传的文件由本机启动的服务处理。
 如需使用其他已安装的运行时，可通过 `--engine` 和 `--device` 指定，例如
 `python web_app.py --engine onnxruntime --device gpu`。
+
+### 部署到 Vercel
+
+安装并登录 Vercel CLI，在仓库中首次执行 `vercel link` 关联项目，然后在 Linux、macOS 或 WSL 的 Bash 中部署：
+
+```bash
+bash ./deploy_vercel.sh       # 预览部署
+bash ./deploy_vercel.sh --prod
+```
+
+Vercel 入口固定使用 ONNX Runtime CPU 和 mobile OCR 模型。模型会在首次请求时下载到函数临时目录；冷启动后可能需要重新下载。Vercel Functions 的请求体和响应体均限制为 4.5 MB，因此上传的 PDF 与生成的带书签 PDF 都必须小于此限制。
+部署脚本会根据 `pyproject.toml` 临时生成 Linux CPU 版 `requirements.txt`，部署结束后删除；仓库不再保存固定依赖清单。
 
 ## 常用命令行参数
 
