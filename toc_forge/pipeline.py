@@ -53,6 +53,17 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+def _log_timing(stage: str, started_at: float, **details: object) -> None:
+    """Write a consistently searchable debug timing record for a pipeline stage."""
+    fields = " ".join(f"{key}={value}" for key, value in details.items())
+    logger.debug(
+        "timing stage=%s elapsed=%.2fs%s",
+        stage,
+        time.perf_counter() - started_at,
+        f" {fields}" if fields else "",
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class BookmarkResult:
     """Named result returned by :func:`bookmark_pdf`."""
@@ -232,9 +243,11 @@ def bookmark_pdf(
     output_filename: str | None = None,
 ) -> BookmarkResult:
     start_time = time.perf_counter()
+    stage_start = time.perf_counter()
     pdf_hash = compute_file_hash(input) if cache_dir else None
     doc = pymupdf.open(input)
     llm_usage = LlmUsage()
+    _log_timing("open_pdf", stage_start, pages=doc.page_count, cache=bool(cache_dir))
 
     def _ensure_model(model_name: str) -> str:
         if engine and engine.strip().lower() == "onnxruntime":
@@ -244,7 +257,9 @@ def bookmark_pdf(
         return os.path.join(model_dir, model_directory_name(model_name, engine))
 
     layout_detection_model = "PP-DocLayout_plus-L"
+    stage_start = time.perf_counter()
     layout_detection_model_dir = _ensure_model(layout_detection_model)
+    _log_timing("prepare_layout_model_files", stage_start)
 
     # 引擎行为只在被显式指定时才传入，None 保持 PaddleX 默认：
     # - engine: 如 "onnxruntime" 时使用模型目录下的 inference.onnx 推理，
@@ -262,12 +277,14 @@ def bookmark_pdf(
         _engine_kwargs["cpu_threads"] = cpu_threads
     if enable_mkldnn is not None:
         _engine_kwargs["enable_mkldnn"] = enable_mkldnn
+    stage_start = time.perf_counter()
     layout_model = LayoutDetection(
         model_name=layout_detection_model,
         model_dir=layout_detection_model_dir,
         device=device,
         **_engine_kwargs,
     )
+    _log_timing("initialize_layout_model", stage_start, engine=engine, device=device)
     # 目录页批量扫描：一次扫 25 页，最多扫 min(toc_detect_max_page, 总页数) 页；
     # 某一批内看到目录页（布局 content 框）后批大小降为 10，直到连续 3 页非目录
     # 页才停止。每页布局结果按页缓存，二次使用不重复推理。
@@ -275,6 +292,7 @@ def bookmark_pdf(
         toc_detect_max_page if toc_detect_max_page else DEFAULT_TOC_DETECT_MAX_PAGE,
         doc.page_count,
     )
+    stage_start = time.perf_counter()
     scan_end, _scan_toc = scan_toc_page_range(
         doc,
         layout_model,
@@ -284,6 +302,8 @@ def bookmark_pdf(
         cache_dir=cache_dir,
         pdf_hash=pdf_hash,
     )
+    _log_timing("detect_toc_pages", stage_start, scanned_pages=scan_end, layout_toc_pages=len(_scan_toc))
+    stage_start = time.perf_counter()
     page_imgs, layout_results = layout_pages_in_range(
         doc,
         layout_model,
@@ -295,9 +315,11 @@ def bookmark_pdf(
         pdf_hash=pdf_hash,
     )
     toc_pages, number_pages, all_boxes = extract_toc_and_number_pages(layout_results)
+    _log_timing("load_toc_layout_results", stage_start, pages=scan_end, toc_pages=len(toc_pages), number_pages=len(number_pages))
     logger.debug(f"number_pages: {number_pages}")
 
     doc_ori_classify_model = "PP-LCNet_x1_0_doc_ori"
+    stage_start = time.perf_counter()
     doc_ori_classify_model_dir = _ensure_model(doc_ori_classify_model)
     # OCR 模型规格：server（默认，精度高）或 mobile（CPU 上快一个量级，
     # GUI 打包版只有 CPU 可用，用 mobile 控制耗时）
@@ -309,9 +331,11 @@ def bookmark_pdf(
         text_recognition_model = "PP-OCRv5_server_rec"
     text_detection_model_dir = _ensure_model(text_detection_model)
     text_recognition_model_dir = _ensure_model(text_recognition_model)
+    _log_timing("prepare_ocr_model_files", stage_start, ocr_model_size=ocr_model_size)
 
     # 无论哪种策略都创建 OCR 模型：llm/local_ocr 用它做目录 OCR，
     # 页码扫描（get_page_offset2）也需要它，vllm 策略同样需要。
+    stage_start = time.perf_counter()
     ocr_model = PaddleOCR(
         use_doc_orientation_classify=True,
         use_doc_unwarping=False,
@@ -325,12 +349,14 @@ def bookmark_pdf(
         device=device,
         **_engine_kwargs,
     )
+    _log_timing("initialize_ocr_model", stage_start, engine=engine, device=device)
 
     # 布局漏检的目录页补充：页面上部有 paragraph_title 或页角 header 的文本为
     # "Contents"/"目录" 时也判为目录页（如英文教材 CONTENTS 页眉页，Layout
     # 只标了 text/header 而没有 content box）；补充页无 content box，OCR 过滤
     # 用合成的整页框（排除页眉页脚带与命中的标题框，避免 "CONTENTS v" 之类
     # 被解析成目录条目）。
+    stage_start = time.perf_counter()
     toc_pages.extend(
         detect_toc_pages_by_keyword(
             all_boxes,
@@ -343,9 +369,11 @@ def bookmark_pdf(
             pdf_hash=pdf_hash,
         )
     )
+    _log_timing("toc_keyword_supplement", stage_start, toc_pages=len(toc_pages))
     # 目录页连续传播：英文书目录常跨多页，但只有首页带 "Contents" 标题
     # （如 OpenStax），后续页没有关键词可依；对已确认目录页的后续页检查
     # "行尾带页码"风格（"4.10 Antiderivatives 419"），符合则续上目录页。
+    stage_start = time.perf_counter()
     toc_pages.extend(
         detect_toc_pages_by_continuity(
             toc_pages,
@@ -358,6 +386,7 @@ def bookmark_pdf(
             pdf_hash=pdf_hash,
         )
     )
+    _log_timing("toc_continuity_supplement", stage_start, toc_pages=len(toc_pages))
     # 目录页去噪：只保留最大连续页段，丢弃孤立误检（如 [5, 7, 8, 9] -> [7, 8, 9]）
     toc_pages = keep_longest_contiguous_pages(toc_pages)
     if not toc_pages:
@@ -372,6 +401,7 @@ def bookmark_pdf(
     if last_toc_page >= 0:
         sampling_end = min(last_toc_page + 20 + 1, doc.page_count)
         if sampling_end > scan_end:
+            stage_start = time.perf_counter()
             ext_imgs, ext_results = layout_pages_in_range(
                 doc,
                 layout_model,
@@ -387,6 +417,7 @@ def bookmark_pdf(
                 ext_results, start=scan_end
             )
             number_pages.extend(ext_number_pages)
+            _log_timing("sample_page_number_layout", stage_start, pages=sampling_end - scan_end, number_pages=len(ext_number_pages))
             logger.debug(
                 f"page-number sampling: extended layout scan to page "
                 f"{sampling_end - 1} (last TOC page {last_toc_page})"
@@ -397,6 +428,7 @@ def bookmark_pdf(
     del layout_model
     gc.collect()
 
+    stage_start = time.perf_counter()
     if toc_strategy == "vllm":
         llm_result = build_toc_vllm(
             toc_pages,
@@ -440,6 +472,7 @@ def bookmark_pdf(
             cache_dir=cache_dir,
             pdf_hash=pdf_hash,
         )
+    _log_timing("build_toc_tree", stage_start, strategy=toc_strategy, toc_pages=len(toc_pages), root_entries=len(toc_tree1))
 
     if not toc_tree1:
         doc.close()
@@ -449,6 +482,7 @@ def bookmark_pdf(
     # （get_page_offset2），不再调用 PPStructureV3（加载子模型多、耗时长）。
     # 这里显式走三阶段而不是 get_page_offset2 wrapper，是为了拿到 number OCR
     # 结果做罗马页码格式检测（detect_roman_arabic_format）。
+    stage_start = time.perf_counter()
     kept_pages = get_number_box_pages(number_pages, page_imgs)
     number_ocr_results = ocr_number_boxes(
         kept_pages,
@@ -460,6 +494,7 @@ def bookmark_pdf(
         pdf_hash=pdf_hash,
     )
     page_offset = compute_page_offset(number_ocr_results)
+    _log_timing("calculate_page_offset", stage_start, candidate_pages=len(number_pages), kept_pages=len(kept_pages), ocr_pages=len(number_ocr_results), page_offset=page_offset)
     logger.debug(f"page_offset: {page_offset}")
     # front matter 偏移：有的书 front matter 用罗马页码（"vii"）、正文用阿拉伯
     # 数字（1, 2, ...），两套体系 offset 不同（如 Kibble：正文 offset 20，
@@ -492,6 +527,7 @@ def bookmark_pdf(
     # 形式的书（如 Morin 力学），先检测格式，再把每章页码映射成累计阿拉伯
     # 页码，加书签时用映射后的页码计算偏移。
     page_map = None
+    stage_start = time.perf_counter()
     if detect_roman_arabic_format(number_ocr_results):
         start_page = max((p["page"] for p in toc_pages), default=-1) + 1
         page_map = build_page_map(
@@ -509,12 +545,14 @@ def bookmark_pdf(
             if page_map
             else "roman page map: format detected but no entries found"
         )
+    _log_timing("build_roman_page_map", stage_start, entries=len(page_map) if page_map else 0)
 
     # 分段页码映射：有些书（如 Shankar）印刷页码与 PDF 索引不是单一线性
     # 关系（章节边界跳号）。先抽样各章起始页检查 offset 是否一致，只有
     # 发现分段才全书扫描构建段表（书签 int 页码先查段表，段内线性、
     # 段间空洞取最近段反推）——单 offset 的书抽样即可，省去全书扫描。
     arabic_segments = None
+    stage_start = time.perf_counter()
     if detect_segmented_offset(
         doc,
         ocr_model,
@@ -533,10 +571,17 @@ def bookmark_pdf(
             cache_dir=cache_dir,
             pdf_hash=pdf_hash,
         )
+    _log_timing(
+        "detect_segmented_page_offset",
+        stage_start,
+        segments=len(arabic_segments) if arabic_segments else 0,
+    )
 
     # OCR 模型用完即释放（onnxruntime 的 CUDA arena 显存不自动归还）
+    stage_start = time.perf_counter()
     del ocr_model
     gc.collect()
+    _log_timing("release_ocr_model", stage_start)
 
     # add bookmarks to PDF
     if not os.path.exists(output):
@@ -551,6 +596,7 @@ def bookmark_pdf(
     else:
         output_basename = f"{Path(input).stem}_bookmarked.pdf"
     pdf_bookmarks_path = os.path.join(output, output_basename)
+    stage_start = time.perf_counter()
     skipped_titles = add_bookmarks_to_pdf(
         doc,
         toc_tree1,
@@ -560,6 +606,7 @@ def bookmark_pdf(
         front_offset=front_offset,
         arabic_segments=arabic_segments,
     )
+    _log_timing("write_bookmarks", stage_start, skipped=len(skipped_titles))
     if skipped_titles:
         logger.warning(
             "Skipped %d unresolved bookmark(s): %s",

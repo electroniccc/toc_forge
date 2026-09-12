@@ -46,7 +46,9 @@ def layout_pages_in_range(
     ``(imgs, results)``, both aligned to ``[start, end)`` — ``imgs[i]`` /
     ``results[i]`` correspond to page ``start + i``.
     """
+    started_at = time.perf_counter()
     imgs = [image_from_page(doc[i]) for i in range(start, end)]
+    render_elapsed = time.perf_counter() - started_at
     results: list = []
     missing: list[int] = []
     for i in range(start, end):
@@ -63,7 +65,9 @@ def layout_pages_in_range(
             missing.append(i)
     if missing:
         missing_imgs = [imgs[i - start] for i in missing]
+        inference_started_at = time.perf_counter()
         preds = layout_model.predict(missing_imgs, layout_nms=True)
+        inference_elapsed = time.perf_counter() - inference_started_at
         for i, res in zip(missing, preds):
             results[i - start] = res
             if cache_dir and pdf_hash:
@@ -74,6 +78,20 @@ def layout_pages_in_range(
             if do_debug:
                 res.save_to_img(os.path.join(output, f"page_layout_{i}.png"))
                 res.save_to_json(os.path.join(output, f"page_layout_{i}.json"))
+    else:
+        inference_elapsed = 0.0
+    logger.debug(
+        "timing stage=layout_pages elapsed=%.2fs render=%.2fs inference=%.2fs "
+        "pages=%d cached=%d inferred=%d range=%d:%d",
+        time.perf_counter() - started_at,
+        render_elapsed,
+        inference_elapsed,
+        end - start,
+        end - start - len(missing),
+        len(missing),
+        start,
+        end,
+    )
     return imgs, results
 
 
@@ -590,6 +608,8 @@ def ocr_toc_pages(
 ) -> list[dict]:
     t0 = time.perf_counter()
     toc_results = []
+    cached_count = 0
+    inference_elapsed = 0.0
     for toc_page in toc_pages:
         page_idx = toc_page["page"]
         img = page_imgs[page_idx]
@@ -601,9 +621,12 @@ def ocr_toc_pages(
         )
         cached = _cache_load(cache_path) if cache_path else None
         if cached is not None:
+            cached_count += 1
             result = CachedResult(_unwrap_legacy_cache(cached))
         else:
+            inference_started_at = time.perf_counter()
             results = ocr_model.predict(img)
+            inference_elapsed += time.perf_counter() - inference_started_at
             if cache_path:
                 _cache_save(cache_path, _cacheable_dict(results[0]))
             if do_debug:
@@ -630,7 +653,12 @@ def ocr_toc_pages(
             {"page": page_idx, "angle": angle, "content_boxes": toc_result}
         )
     logger.debug(
-        f"OCR toc pages cost: {time.perf_counter() - t0:.2f}s ({len(toc_pages)} pages)"
+        "timing stage=ocr_toc_pages elapsed=%.2fs inference=%.2fs pages=%d cached=%d inferred=%d",
+        time.perf_counter() - t0,
+        inference_elapsed,
+        len(toc_pages),
+        cached_count,
+        len(toc_pages) - cached_count,
     )
     return toc_results
 
@@ -706,6 +734,8 @@ def ocr_number_boxes(
     """
     t0 = time.perf_counter()
     ocr_results = []
+    cached_count = 0
+    inference_elapsed = 0.0
     for it in kept_pages:
         page_idx = it["page"]
         img = page_imgs[page_idx]
@@ -724,9 +754,12 @@ def ocr_number_boxes(
         )
         cached = _cache_load(cache_path) if cache_path else None
         if cached is not None:
+            cached_count += 1
             result = CachedResult(_unwrap_legacy_cache(cached))
         else:
+            inference_started_at = time.perf_counter()
             results = ocr_model.predict(crop)
+            inference_elapsed += time.perf_counter() - inference_started_at
             result = results[0]
             if cache_path:
                 _cache_save(cache_path, _cacheable_dict(result))
@@ -759,7 +792,12 @@ def ocr_number_boxes(
 
         ocr_results.append({"page": page_idx, "rec_texts": result["rec_texts"]})
     logger.debug(
-        f"OCR number pages cost: {time.perf_counter() - t0:.2f}s ({len(kept_pages)} pages)"
+        "timing stage=ocr_number_boxes elapsed=%.2fs inference=%.2fs pages=%d cached=%d inferred=%d",
+        time.perf_counter() - t0,
+        inference_elapsed,
+        len(kept_pages),
+        cached_count,
+        len(kept_pages) - cached_count,
     )
     return ocr_results
 
@@ -771,6 +809,7 @@ def compute_page_offset(ocr_results: list[dict]) -> int:
     OCR text) are skipped, and the mode of the remaining offsets is returned
     (median on ties) — so isolated OCR misreads (e.g. 6/9 confusion) are tolerated.
     """
+    started_at = time.perf_counter()
     offsets = []
     for res in ocr_results:
         texts = "".join(res["rec_texts"])
@@ -787,12 +826,19 @@ def compute_page_offset(ocr_results: list[dict]) -> int:
 
     if not offsets:
         logger.warning("compute_page_offset: no valid page numbers found, offset=0")
+        logger.debug("timing stage=compute_page_offset elapsed=%.2fs valid_pages=0", time.perf_counter() - started_at)
         return 0
     try:
-        return statistics.mode(offsets)
+        page_offset = statistics.mode(offsets)
     except statistics.StatisticsError:
         # tie — use median for stability
-        return int(statistics.median(offsets))
+        page_offset = int(statistics.median(offsets))
+    logger.debug(
+        "timing stage=compute_page_offset elapsed=%.2fs valid_pages=%d",
+        time.perf_counter() - started_at,
+        len(offsets),
+    )
+    return page_offset
 
 
 def get_page_offset2(
