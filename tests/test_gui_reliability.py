@@ -1,7 +1,10 @@
 import os
 import tempfile
+import threading
+import time
 import tomllib
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,7 +13,11 @@ import requests
 import gui_app
 from toc_forge import gui_support
 from toc_forge import utils
-from toc_forge.utils import make_sure_onnx_model_exists, model_directory_name
+from toc_forge.utils import (
+    make_sure_model_exists,
+    make_sure_onnx_model_exists,
+    model_directory_name,
+)
 
 
 class _IncompleteResponse:
@@ -74,7 +81,67 @@ class DownloadTests(unittest.TestCase):
                 gui_support.stream_download("https://example.invalid/model", dst, None, retries=1)
 
             self.assertEqual(Path(dst).read_bytes(), b"known-good")
-            self.assertFalse(os.path.exists(dst + ".part"))
+            self.assertEqual(list(Path(tmp).glob(".inference.onnx-*.part")), [])
+
+    def test_concurrent_onnx_model_requests_download_each_file_once(self):
+        name = "PP-OCRv5_server_rec"
+        worker_count = 5
+        start_barrier = threading.Barrier(worker_count)
+        request_count = 0
+        request_count_lock = threading.Lock()
+
+        def slow_get(*_args, **_kwargs):
+            nonlocal request_count
+            with request_count_lock:
+                request_count += 1
+            time.sleep(0.03)
+            return _CompleteResponse()
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            utils.requests, "get", side_effect=slow_get
+        ):
+            def ensure_model(_index):
+                start_barrier.wait()
+                make_sure_onnx_model_exists(tmp, name)
+
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                list(executor.map(ensure_model, range(worker_count)))
+
+            target = Path(tmp, f"{name}_onnx")
+            self.assertEqual(request_count, 2)
+            self.assertEqual((target / "inference.yml").read_bytes(), b"data")
+            self.assertEqual((target / "inference.onnx").read_bytes(), b"data")
+            self.assertEqual(list(target.glob(".*.part")), [])
+
+    def test_paddle_model_directory_is_staged_before_atomic_install(self):
+        name = "PP-DocLayout_plus-L"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp, name)
+
+            def fake_download(_url, staging_root, downloaded_name):
+                self.assertEqual(downloaded_name, name)
+                self.assertFalse(target.exists())
+                staged = Path(staging_root, downloaded_name)
+                staged.mkdir()
+                (staged / "inference.json").write_bytes(b"complete-model")
+
+            with (
+                patch.dict(os.environ, {"PADDLE_PDX_CACHE_HOME": ""}),
+                patch(
+                    "paddlex.utils.download.download_and_extract",
+                    side_effect=fake_download,
+                ),
+            ):
+                make_sure_model_exists(tmp, name)
+
+            self.assertEqual(
+                (target / "inference.json").read_bytes(), b"complete-model"
+            )
+            self.assertEqual(
+                [path for path in Path(tmp).glob(f".{name}-*") if path.is_dir()],
+                [],
+            )
 
     def test_model_requires_both_nontrivial_onnx_and_yaml_files(self):
         with tempfile.TemporaryDirectory() as tmp:

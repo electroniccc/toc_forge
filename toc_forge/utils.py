@@ -371,19 +371,24 @@ def stream_download(
     progress_cb: Callable[[float], None] | None,
     retries: int = 3,
 ) -> None:
-    """Download to ``dst.part`` and atomically replace ``dst`` on success."""
+    """Download to a unique temporary file and atomically replace ``dst``."""
     destination = os.path.abspath(dst)
-    os.makedirs(os.path.dirname(destination), exist_ok=True)
-    part_path = destination + ".part"
+    destination_dir = os.path.dirname(destination)
+    os.makedirs(destination_dir, exist_ok=True)
     last_err: Exception | None = None
 
     for attempt in range(retries):
+        fd, part_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(destination)}-",
+            suffix=".part",
+            dir=destination_dir,
+        )
         try:
-            with requests.get(url, stream=True, timeout=30) as response:
-                response.raise_for_status()
-                total = int(response.headers.get("content-length", 0))
-                downloaded = 0
-                with open(part_path, "wb") as f:
+            with os.fdopen(fd, "wb") as f:
+                with requests.get(url, stream=True, timeout=30) as response:
+                    response.raise_for_status()
+                    total = int(response.headers.get("content-length", 0))
+                    downloaded = 0
                     for chunk in response.iter_content(chunk_size=65536):
                         if not chunk:
                             continue
@@ -391,19 +396,15 @@ def stream_download(
                         downloaded += len(chunk)
                         if progress_cb and total:
                             progress_cb(downloaded / total)
-                    f.flush()
-                    os.fsync(f.fileno())
-                if downloaded == 0 or (total and downloaded != total):
-                    raise requests.ConnectionError(
-                        f"incomplete download: {downloaded} of {total} bytes"
-                    )
+                f.flush()
+                os.fsync(f.fileno())
+            if downloaded == 0 or (total and downloaded != total):
+                raise requests.ConnectionError(
+                    f"incomplete download: {downloaded} of {total} bytes"
+                )
             os.replace(part_path, destination)
             return
         except (requests.RequestException, OSError) as exc:
-            try:
-                os.unlink(part_path)
-            except FileNotFoundError:
-                pass
             if (
                 isinstance(exc, requests.HTTPError)
                 and exc.response is not None
@@ -413,6 +414,11 @@ def stream_download(
             last_err = exc
             if attempt < retries - 1:
                 time.sleep(1.0 + attempt)
+        finally:
+            try:
+                os.unlink(part_path)
+            except FileNotFoundError:
+                pass
 
     raise requests.ConnectionError(
         f"download failed after {retries} attempts: {last_err}"
@@ -426,28 +432,29 @@ def make_sure_onnx_model_exists(model_dir: str, model_name: str) -> None:
     ONNX files. It deliberately never treats the Paddle directory as a cache
     hit: ``{model_name}`` and ``{model_name}_onnx`` are different formats.
     """
-    missing = _onnx_model_missing_files(model_dir, model_name)
-    if missing:
-        target = os.path.join(
-            model_dir, model_directory_name(model_name, "onnxruntime")
-        )
-        os.makedirs(target, exist_ok=True)
-        for filename in missing:
-            url = _ONNX_MODEL_SOURCE.format(
-                model_name=model_name, filename=filename
-            )
-            logger.info("Downloading ONNX model file %s from %s", filename, url)
-            stream_download(url, os.path.join(target, filename), None)
+    target_name = model_directory_name(model_name, "onnxruntime")
+    lock_path = os.path.join(model_dir, f".{target_name}.download.lock")
+    with _exclusive_file_lock(lock_path):
+        # Another caller may have completed the model while this caller was
+        # waiting, so the missing-file check belongs inside the lock.
+        missing = _onnx_model_missing_files(model_dir, model_name)
+        if missing:
+            target = os.path.join(model_dir, target_name)
+            os.makedirs(target, exist_ok=True)
+            for filename in missing:
+                url = _ONNX_MODEL_SOURCE.format(
+                    model_name=model_name, filename=filename
+                )
+                logger.info("Downloading ONNX model file %s from %s", filename, url)
+                stream_download(url, os.path.join(target, filename), None)
 
-    remaining = _onnx_model_missing_files(model_dir, model_name)
-    if remaining:
-        target = os.path.join(
-            model_dir, model_directory_name(model_name, "onnxruntime")
-        )
-        raise FileNotFoundError(
-            f"ONNX model {model_name!r} is missing {', '.join(remaining)} under "
-            f"{target!r}."
-        )
+        remaining = _onnx_model_missing_files(model_dir, model_name)
+        if remaining:
+            target = os.path.join(model_dir, target_name)
+            raise FileNotFoundError(
+                f"ONNX model {model_name!r} is missing {', '.join(remaining)} under "
+                f"{target!r}."
+            )
 
 
 def make_sure_model_exists(model_dir: str, model_name: str) -> None:
@@ -455,20 +462,38 @@ def make_sure_model_exists(model_dir: str, model_name: str) -> None:
     if os.path.isdir(target):
         return
 
-    # Check PaddleX official cache first (copy if found, to avoid re-download)
-    cache_home = os.environ.get("PADDLE_PDX_CACHE_HOME", "")
-    if cache_home:
-        cached = os.path.join(cache_home, "official_models", model_name)
-        if os.path.isdir(cached):
-            os.makedirs(model_dir, exist_ok=True)
-            shutil.copytree(cached, target)
-            logger.info("Copied model %s from cache to %s", model_name, target)
+    lock_path = os.path.join(model_dir, f".{model_name}.download.lock")
+    with _exclusive_file_lock(lock_path):
+        if os.path.isdir(target):
             return
 
-    # Not in cache — download directly to target directory
-    os.makedirs(model_dir, exist_ok=True)
-    url = f"{_BOS_BASE_URL}/{_BOS_VERSION}/{model_name}_infer.tar"
-    logger.info("Downloading model %s from %s", model_name, url)
-    from paddlex.utils.download import download_and_extract
+        # Build the complete model under the destination filesystem, then
+        # publish the directory in one rename.  Other callers never observe a
+        # partially copied or partially extracted target directory.
+        staging_root = tempfile.mkdtemp(prefix=f".{model_name}-", dir=model_dir)
+        staged_target = os.path.join(staging_root, model_name)
+        try:
+            cache_home = os.environ.get("PADDLE_PDX_CACHE_HOME", "")
+            cached = (
+                os.path.join(cache_home, "official_models", model_name)
+                if cache_home
+                else ""
+            )
+            if cached and os.path.isdir(cached):
+                shutil.copytree(cached, staged_target)
+                logger.info("Copied model %s from cache to %s", model_name, target)
+            else:
+                url = f"{_BOS_BASE_URL}/{_BOS_VERSION}/{model_name}_infer.tar"
+                logger.info("Downloading model %s from %s", model_name, url)
+                from paddlex.utils.download import download_and_extract
 
-    download_and_extract(url, model_dir, model_name)
+                download_and_extract(url, staging_root, model_name)
+
+            if not os.path.isdir(staged_target):
+                raise FileNotFoundError(
+                    f"Downloaded model {model_name!r} did not create "
+                    f"{staged_target!r}."
+                )
+            os.replace(staged_target, target)
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
