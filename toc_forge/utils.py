@@ -7,7 +7,11 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
+import weakref
+from _thread import LockType
+from contextlib import contextmanager
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -49,6 +53,56 @@ def format_duration(seconds: float) -> str:
 
 
 # ---- Caching ----
+
+_file_lock_registry_guard = threading.Lock()
+_file_lock_registry: weakref.WeakValueDictionary[str, LockType] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _thread_lock_for_file(path: str) -> LockType:
+    """Return the shared in-process lock associated with an absolute path."""
+    normalized = os.path.normcase(os.path.abspath(path))
+    with _file_lock_registry_guard:
+        lock = _file_lock_registry.get(normalized)
+        if lock is None:
+            lock = threading.Lock()
+            _file_lock_registry[normalized] = lock
+        return lock
+
+
+@contextmanager
+def _exclusive_file_lock(path: str):
+    """Hold an exclusive file lock, with explicit same-process thread safety.
+
+    Linux uses ``flock`` in addition to the thread lock.  The thread lock is
+    kept because the supported concurrent caller is another thread in this
+    process, and it also provides a functional fallback on non-POSIX systems.
+    """
+    lock_path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    thread_lock = _thread_lock_for_file(lock_path)
+    with thread_lock:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if os.name == "posix":
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            if os.name == "posix":
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+@contextmanager
+def _cache_space_lock(cache_dir: str, pdf_hash: str):
+    """Serialize users of one PDF's shared cache namespace."""
+    directory = os.path.join(cache_dir, pdf_hash)
+    with _exclusive_file_lock(os.path.join(directory, ".cache.lock")):
+        yield
+
 
 class CachedResult(dict):
     """A dict that mimics PaddleX result objects: dict access + .json property."""

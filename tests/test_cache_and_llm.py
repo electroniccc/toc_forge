@@ -2,8 +2,13 @@ import hashlib
 import inspect
 import os
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
+from toc_forge import pipeline
 from toc_forge.llm import (
     _TOC_LLM_SYSTEM_PROMPT,
     _TOC_VLLM_SYSTEM_PROMPT,
@@ -16,7 +21,7 @@ from toc_forge.llm import (
     build_toc_llm,
     build_toc_vllm,
 )
-from toc_forge.utils import _cache_load, _cache_save, compute_file_hash
+from toc_forge.utils import _cache_load, _cache_path, _cache_save, compute_file_hash
 
 
 class LlmInputTests(unittest.TestCase):
@@ -118,6 +123,63 @@ class CacheIdentityTests(unittest.TestCase):
 
         self.assertEqual(digest, hashlib.sha256(content).hexdigest())
         self.assertEqual(len(digest), 64)
+
+    def test_same_pdf_threads_share_one_locked_cache_fill(self):
+        worker_count = 6
+        start_barrier = threading.Barrier(worker_count)
+        counter_lock = threading.Lock()
+        producer_calls = 0
+
+        with tempfile.TemporaryDirectory() as root:
+            input_path = os.path.join(root, "fixture.pdf")
+            cache_dir = os.path.join(root, "cache")
+            with open(input_path, "wb") as f:
+                f.write(b"same PDF bytes for every thread")
+            pdf_hash = compute_file_hash(input_path)
+            cache_path = _cache_path(cache_dir, pdf_hash, "ocr", 0)
+
+            def fake_pipeline(**_kwargs):
+                nonlocal producer_calls
+                cached = _cache_load(cache_path)
+                if cached is None:
+                    with counter_lock:
+                        producer_calls += 1
+                    # Keep the miss window open long enough that this test
+                    # reproduces the old cache-stampede behavior without the
+                    # bookmark_pdf-level lock.
+                    time.sleep(0.05)
+                    cached = {"producer": producer_calls, "complete": True}
+                    _cache_save(cache_path, cached)
+                return cached
+
+            def invoke_bookmark_pdf():
+                start_barrier.wait()
+                return pipeline.bookmark_pdf(
+                    input=input_path,
+                    output=os.path.join(root, "output"),
+                    model_dir=os.path.join(root, "models"),
+                    cache_dir=cache_dir,
+                )
+
+            with patch.object(
+                pipeline, "_bookmark_pdf_impl", side_effect=fake_pipeline
+            ):
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    results = list(
+                        executor.map(
+                            lambda _index: invoke_bookmark_pdf(),
+                            range(worker_count),
+                        )
+                    )
+
+            self.assertEqual(producer_calls, 1)
+            self.assertTrue(all(result == results[0] for result in results))
+            self.assertEqual(
+                _cache_load(cache_path), {"producer": 1, "complete": True}
+            )
+            self.assertTrue(
+                os.path.isfile(os.path.join(cache_dir, pdf_hash, ".cache.lock"))
+            )
 
     def test_failed_cache_write_preserves_the_previous_complete_value(self):
         with tempfile.TemporaryDirectory() as cache_dir:

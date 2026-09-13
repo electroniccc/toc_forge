@@ -43,6 +43,7 @@ from .parsing import (
     restore_toc_order,
 )
 from .utils import (
+    _cache_space_lock,
     _roman_to_int,
     compute_file_hash,
     make_sure_onnx_model_exists,
@@ -243,8 +244,66 @@ def bookmark_pdf(
     output_filename: str | None = None,
 ) -> BookmarkResult:
     start_time = time.perf_counter()
-    stage_start = time.perf_counter()
     pdf_hash = compute_file_hash(input) if cache_dir else None
+
+    def _run() -> BookmarkResult:
+        return _bookmark_pdf_impl(
+            input=input,
+            output=output,
+            model_dir=model_dir,
+            do_debug=do_debug,
+            cache_dir=cache_dir,
+            toc_strategy=toc_strategy,
+            api_base_url=api_base_url,
+            api_key=api_key,
+            llm_name=llm_name,
+            vllm_name=vllm_name,
+            no_toc_cache=no_toc_cache,
+            device=device,
+            llm_timeout=llm_timeout,
+            cpu_threads=cpu_threads,
+            engine=engine,
+            enable_mkldnn=enable_mkldnn,
+            ocr_model_size=ocr_model_size,
+            toc_detect_max_page=toc_detect_max_page,
+            output_filename=output_filename,
+            pdf_hash=pdf_hash,
+            start_time=start_time,
+        )
+
+    if cache_dir and pdf_hash:
+        with _cache_space_lock(cache_dir, pdf_hash):
+            return _run()
+    return _run()
+
+
+def _bookmark_pdf_impl(
+    input: str,
+    output: str,
+    model_dir: str,
+    do_debug: bool = False,
+    cache_dir: str | None = None,
+    toc_strategy: str = "local_ocr",
+    api_base_url: str | None = None,
+    api_key: str | None = None,
+    llm_name: str = "deepseek-v4-flash",
+    vllm_name: str = "qwen3.6-35b-a3b",
+    no_toc_cache: bool = False,
+    device: str | None = None,
+    llm_timeout: float = 600.0,
+    cpu_threads: int | None = None,
+    engine: str | None = None,
+    enable_mkldnn: bool | None = None,
+    ocr_model_size: str = "server",
+    toc_detect_max_page: int | None = None,
+    output_filename: str | None = None,
+    *,
+    pdf_hash: str | None = None,
+    start_time: float | None = None,
+) -> BookmarkResult:
+    if start_time is None:
+        start_time = time.perf_counter()
+    stage_start = time.perf_counter()
     doc = pymupdf.open(input)
     llm_usage = LlmUsage()
     _log_timing("open_pdf", stage_start, pages=doc.page_count, cache=bool(cache_dir))
