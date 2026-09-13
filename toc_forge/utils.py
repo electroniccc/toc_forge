@@ -72,12 +72,12 @@ def _cacheable_dict(result: Any) -> dict[str, Any]:
 
 
 def compute_file_hash(filepath: str) -> str:
-    """SHA256 hex digest of a file, truncated to 16 chars."""
+    """Return the complete SHA-256 hex digest of a file."""
     sha = hashlib.sha256()
     with open(filepath, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
             sha.update(chunk)
-    return sha.hexdigest()[:16]
+    return sha.hexdigest()
 
 
 def _cache_path(

@@ -1,3 +1,4 @@
+import hashlib
 import inspect
 import os
 import tempfile
@@ -15,7 +16,7 @@ from toc_forge.llm import (
     build_toc_llm,
     build_toc_vllm,
 )
-from toc_forge.utils import _cache_load, _cache_save
+from toc_forge.utils import _cache_load, _cache_save, compute_file_hash
 
 
 class LlmInputTests(unittest.TestCase):
@@ -106,6 +107,18 @@ class LlmInputTests(unittest.TestCase):
 
 
 class CacheIdentityTests(unittest.TestCase):
+    def test_pdf_cache_identity_uses_the_complete_sha256_digest(self):
+        content = b"a PDF-shaped cache identity fixture"
+        with tempfile.TemporaryDirectory() as cache_dir:
+            path = os.path.join(cache_dir, "fixture.pdf")
+            with open(path, "wb") as f:
+                f.write(content)
+
+            digest = compute_file_hash(path)
+
+        self.assertEqual(digest, hashlib.sha256(content).hexdigest())
+        self.assertEqual(len(digest), 64)
+
     def test_failed_cache_write_preserves_the_previous_complete_value(self):
         with tempfile.TemporaryDirectory() as cache_dir:
             path = f"{cache_dir}/entry.json"
