@@ -267,17 +267,23 @@ def _load_toc_tree_cache(
     cache_dir: str | None,
     pdf_hash: str | None,
     toc_strategy: str,
+    toc_pages: list[int],
+    allow_legacy: bool = False,
 ) -> list[dict] | None:
-    """Return the cached TOC tree for this document/strategy, or None."""
+    """Return a TOC tree only when it covers the currently detected pages."""
     if not cache_dir or not pdf_hash:
         return None
     cache_path = _toc_tree_cache_path(cache_dir, pdf_hash, toc_strategy)
     cached = _cache_load(cache_path)
-    if cached is not None:
+    if allow_legacy and isinstance(cached, list):
+        logger.info("Loaded legacy TOC tree from %s", cache_path)
+        return cached
+    if isinstance(cached, dict) and cached.get("toc_pages") == toc_pages:
         logger.info(
             "Loaded cached TOC tree from %s, skipping LLM call", cache_path
         )
-    return cached
+        return cached.get("toc_tree")
+    return None
 
 
 def _save_toc_tree_cache(
@@ -285,12 +291,13 @@ def _save_toc_tree_cache(
     pdf_hash: str | None,
     toc_strategy: str,
     toc_tree: list[dict],
+    toc_pages: list[int],
 ) -> None:
     """Persist the TOC tree so repeat runs skip the LLM call."""
     if not cache_dir or not pdf_hash:
         return
     cache_path = _toc_tree_cache_path(cache_dir, pdf_hash, toc_strategy)
-    _cache_save(cache_path, toc_tree)
+    _cache_save(cache_path, {"toc_pages": toc_pages, "toc_tree": toc_tree})
     logger.info("Saved TOC tree to cache: %s", cache_path)
 
 
@@ -473,7 +480,10 @@ def build_toc_llm(
     if not isinstance(llm_base_url, str) or not llm_base_url.strip():
         raise ValueError("llm_base_url is required")
     if not no_toc_cache:
-        cached = _load_toc_tree_cache(cache_dir, pdf_hash, "llm")
+        cached = _load_toc_tree_cache(
+            cache_dir, pdf_hash, "llm", [p["page"] for p in toc_pages],
+            allow_legacy=not any(p.get("_text_layer_fallback") for p in toc_pages),
+        )
         if cached is not None:
             return LlmBuildResult(_sanitize_toc_tree(cached))
 
@@ -514,7 +524,7 @@ def build_toc_llm(
     )
     toc_tree = result.get("toc", []) if isinstance(result, dict) else result
     toc_tree = _sanitize_toc_tree(toc_tree)
-    _save_toc_tree_cache(cache_dir, pdf_hash, "llm", toc_tree)
+    _save_toc_tree_cache(cache_dir, pdf_hash, "llm", toc_tree, [p["page"] for p in toc_pages])
     return LlmBuildResult(toc_tree, usage)
 
 
@@ -542,7 +552,10 @@ def build_toc_vllm(
     if not isinstance(llm_base_url, str) or not llm_base_url.strip():
         raise ValueError("llm_base_url is required")
     if not no_toc_cache:
-        cached = _load_toc_tree_cache(cache_dir, pdf_hash, "vllm")
+        cached = _load_toc_tree_cache(
+            cache_dir, pdf_hash, "vllm", [p["page"] for p in toc_pages],
+            allow_legacy=not any(p.get("_text_layer_fallback") for p in toc_pages),
+        )
         if cached is not None:
             return LlmBuildResult(_sanitize_toc_tree(cached))
 
@@ -573,5 +586,5 @@ def build_toc_vllm(
     )
     toc_tree = result.get("toc", []) if isinstance(result, dict) else result
     toc_tree = _sanitize_toc_tree(toc_tree)
-    _save_toc_tree_cache(cache_dir, pdf_hash, "vllm", toc_tree)
+    _save_toc_tree_cache(cache_dir, pdf_hash, "vllm", toc_tree, [p["page"] for p in toc_pages])
     return LlmBuildResult(toc_tree, usage)

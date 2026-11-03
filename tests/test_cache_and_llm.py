@@ -206,19 +206,36 @@ class CacheIdentityTests(unittest.TestCase):
             os.path.join(cache_dir, "pdfhash", "toc_tree_llm.json"),
         )
 
-    def test_llm_cache_loads_the_single_saved_tree(self):
+    def test_llm_cache_matches_selected_toc_pages(self):
         tree = [{"title": "Chapter 1", "page_num": 1, "children": []}]
+        pages = [5, 6, 7]
         with tempfile.TemporaryDirectory() as cache_dir:
             _save_toc_tree_cache(
                 cache_dir,
                 "pdfhash",
                 "llm",
                 tree,
+                pages,
             )
 
-            cached = _load_toc_tree_cache(cache_dir, "pdfhash", "llm")
+            cached = _load_toc_tree_cache(cache_dir, "pdfhash", "llm", pages)
+            stale = _load_toc_tree_cache(cache_dir, "pdfhash", "llm", [6, 7])
 
         self.assertEqual(cached, tree)
+        self.assertIsNone(stale)
+
+    def test_legacy_tree_is_reused_only_without_new_text_layer_page(self):
+        tree = [{"title": "Chapter 4", "page_num": 191}]
+        with tempfile.TemporaryDirectory() as cache_dir:
+            path = _toc_tree_cache_path(cache_dir, "pdfhash", "vllm")
+            _cache_save(path, tree)
+            self.assertEqual(
+                _load_toc_tree_cache(cache_dir, "pdfhash", "vllm", [6, 7], allow_legacy=True),
+                tree,
+            )
+            self.assertIsNone(
+                _load_toc_tree_cache(cache_dir, "pdfhash", "vllm", [5, 6, 7]),
+            )
 
 
 if __name__ == "__main__":

@@ -411,6 +411,7 @@ def _bookmark_pdf_impl(
             output=output,
             cache_dir=cache_dir,
             pdf_hash=pdf_hash,
+            document=doc,
         )
     )
     _log_timing("toc_keyword_supplement", stage_start, toc_pages=len(toc_pages))

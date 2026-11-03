@@ -286,6 +286,7 @@ def detect_toc_pages_by_keyword(
     output: str = "output",
     cache_dir: str | None = None,
     pdf_hash: str | None = None,
+    document=None,
 ) -> list[dict]:
     """Find TOC pages the layout model missed, by keyword.
 
@@ -300,6 +301,8 @@ def detect_toc_pages_by_keyword(
     Returns pages as {"page": idx, "content_boxes": [synthetic full-content
     box]} so the normal OCR filtering / parsing flow consumes them unchanged.
     Candidate-box OCR is cached per page under the "toc_keyword" stage.
+    A reliable text layer can also supply a TOC title when layout detection
+    returns no title box at all.
     """
     if skip is None:
         skip = set()
@@ -321,12 +324,16 @@ def detect_toc_pages_by_keyword(
             ):
                 # 页眉左上/右上角的 header（如 CONTENTS 运行页眉）
                 candidates.append(b)
-        if not candidates:
-            continue
+        matched_boxes = []
+        title_box = None
+        if document is not None and page_idx < len(document):
+            title_box = _text_layer_toc_title(document[page_idx], img.shape)
+            if title_box is not None:
+                matched_boxes.append(title_box)
 
         cache_path = (
             _cache_path(cache_dir, pdf_hash, "toc_keyword", page_idx)
-            if cache_dir and pdf_hash
+            if candidates and cache_dir and pdf_hash
             else None
         )
         cached = _cache_load(cache_path) if cache_path else None
@@ -360,12 +367,13 @@ def detect_toc_pages_by_keyword(
             if cache_path:
                 _cache_save(cache_path, {"candidates": cand_texts})
 
-        matched_boxes = []
+        ocr_matched = False
         for ct in cand_texts:
             # join without spaces so split fragments ("目 录") still match
             text = "".join(ct["texts"]).strip().lower()
             if "contents" in text or "目录" in text:
                 matched_boxes.append({"coordinate": ct["coordinate"]})
+                ocr_matched = True
         if not matched_boxes:
             continue
 
@@ -407,9 +415,34 @@ def detect_toc_pages_by_keyword(
                 "content_boxes": [
                     _synthetic_content_box(boxes, img.shape, matched_boxes)
                 ],
+                "_text_layer_fallback": title_box is not None and not ocr_matched,
             }
         )
     return matched_pages
+
+
+def _text_layer_toc_title(page, image_shape):
+    """Return an image-space title box for a genuine text-layer TOC page."""
+    for x0, y0, x1, y1, block_text, *_ in page.get_text("blocks"):
+        if y1 > page.rect.height * 0.4:
+            continue
+        if not re.fullmatch(r"(?:table\s+of\s+)?contents|目录", block_text.strip(), re.I):
+            continue
+        lines = [line.strip() for line in page.get_text().splitlines()]
+        page_labels = sum(bool(re.fullmatch(r"(?:\d{1,4}|[ivxlcdm]+)", line, re.I)) for line in lines)
+        chapters = sum(bool(re.match(r"(?:chapter\s+\d+|第[一二三四五六七八九十百\d]+章)\b", line, re.I)) for line in lines)
+        if page_labels < 2 and chapters < 2:
+            continue
+        h, w = image_shape[:2]
+        return {
+            "coordinate": [
+                x0 * w / page.rect.width,
+                y0 * h / page.rect.height,
+                x1 * w / page.rect.width,
+                y1 * h / page.rect.height,
+            ]
+        }
+    return None
 
 
 def _synthetic_content_box(
