@@ -4,11 +4,26 @@ import unittest
 
 import pymupdf
 
-from toc_forge.page_map import find_text_page_offset, map_toc_pages, resolve_pdf_page
+from toc_forge.page_map import find_text_page_offset, map_arabic_page, map_toc_pages, resolve_pdf_page
 from toc_forge.pipeline import add_bookmarks_to_pdf
 
 
 class PageResolutionTests(unittest.TestCase):
+    def test_appendix_page_number_restart_does_not_override_body_segment(self):
+        segments = [
+            {'printed_start': 1, 'printed_end': 88, 'pdf_start': 17},
+            {'printed_start': 396, 'printed_end': 434, 'pdf_start': 412},
+            {'printed_start': 438, 'printed_end': 494, 'pdf_start': 454},
+            {'printed_start': 1, 'printed_end': 2, 'pdf_start': 533},
+        ]
+        self.assertEqual(map_arabic_page(segments, 438), 454)
+        self.assertEqual(map_arabic_page(segments, 446), 462)
+        self.assertEqual(map_arabic_page(segments, 437), 453)
+        self.assertEqual(map_arabic_page(segments, 1), 17)
+        self.assertEqual(map_arabic_page(segments, 2), 18)
+        reset_inside_body = segments + [{'printed_start': 2, 'printed_end': 3, 'pdf_start': 540}]
+        self.assertEqual(map_arabic_page(reset_inside_body, 2), 18)
+
     def test_long_roman_preface_does_not_force_zero_offset(self):
         with pymupdf.open() as doc:
             for _ in range(44): doc.new_page()

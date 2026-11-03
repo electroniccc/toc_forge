@@ -557,7 +557,7 @@ def map_arabic_page(
     segments: list[dict] | None, page_num
 ) -> int | None:
     """Map a printed Arabic page number to a 0-based PDF index via the
-    segment table.
+    segment table, which may restart at the appendix or index.
 
     Inside a segment the offset is linear; a page number that falls into a
     gap between segments (a printed number the book skips — e.g. Shankar's
@@ -568,12 +568,26 @@ def map_arabic_page(
     if not segments or not isinstance(page_num, int):
         return None
     X = page_num
+    # A restarted appendix can reuse body page numbers. Prefer the longest
+    # covering run (normally the main text) rather than the latest start.
+    covering = [s for s in segments if s["printed_start"] <= X <= s["printed_end"]]
+    if covering:
+        segment = max(
+            covering,
+            key=lambda s: (s["printed_end"] - s["printed_start"], -s["pdf_start"]),
+        )
+        return segment["pdf_start"] + (X - segment["printed_start"])
     s_prev = None
     s_next = None
     for s in segments:
         if s["printed_start"] <= X:
-            s_prev = s
-        elif s_next is None:
+            if (s_prev is None or s["printed_start"] > s_prev["printed_start"]
+                    or (s["printed_start"] == s_prev["printed_start"]
+                        and s["pdf_start"] < s_prev["pdf_start"])):
+                s_prev = s
+        elif (s_next is None or s["printed_start"] < s_next["printed_start"]
+              or (s["printed_start"] == s_next["printed_start"]
+                  and s["pdf_start"] < s_next["pdf_start"])):
             s_next = s
     if s_prev is not None and X <= s_prev["printed_end"]:
         return s_prev["pdf_start"] + (X - s_prev["printed_start"])
