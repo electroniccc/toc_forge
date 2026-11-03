@@ -224,3 +224,5 @@ Printed page numbers often differ from PDF page indices because of covers, front
 ## License
 
 [MIT License](LICENSE)
+
+Printed page numbers are resolved to physical PDF pages before returning the TOC tree. Long Roman-numbered prefaces are supported by text-layer validation or adaptive OCR sampling; unresolved body numbering raises an error instead of silently assuming zero offset. The returned tree and PDF bookmarks share the same mapping, including segmented and Roman numbering.

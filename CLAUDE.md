@@ -268,3 +268,7 @@ Logs go to `log/toc_forge.log` via `setup_logger`. Uses `logging.DEBUG` level, f
 Stage timing is logged at DEBUG level in `ocr_engine.py` (per stage, covering both
 cached and inference paths — `layout detection cost: Xs (N pages, cached|inference)`,
 `OCR toc pages cost: Xs (N pages)`, `OCR number pages cost: Xs (N pages)`).
+
+## Page mapping reliability
+
+Body-page offset detection first requires three consecutive Arabic labels in the PDF text layer after the TOC. For scanned documents, extend number-box layout/OCR sampling in 20-page batches (at most 200 pages after the TOC) until three offsets agree, allowing long Roman-numbered prefaces. If numbering remains unresolved, stop with an explicit error instead of assuming zero. `page_map.resolve_pdf_page` is shared by PDF bookmark writing and the returned `BookmarkResult.toc_tree`; Arabic numeric strings, segmented offsets, Roman front matter and Roman chapter-page labels use the same mapping. Public tree page numbers are 1-based physical PDF pages or None.

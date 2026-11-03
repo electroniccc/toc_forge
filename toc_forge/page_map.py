@@ -604,3 +604,52 @@ def map_page_num(page_map: dict[str, int] | None, page_num) -> int | None:
     if not m:
         return None
     return page_map.get(key)
+
+
+def find_text_page_offset(doc, start_page: int, max_pages: int = 200) -> int | None:
+    """Find three consecutive Arabic page labels after the TOC.
+
+    Long Roman-numbered prefaces must not be mistaken for the body. Require
+    consecutive physical and printed pages, so isolated formula digits do not
+    establish an offset. A missing text layer leaves OCR as the fallback.
+    """
+    previous = None
+    run = 0
+    for idx in range(start_page, min(doc.page_count, start_page + max_pages)):
+        number = _text_layer_page_number(doc, idx)
+        offset = idx - number if number is not None and number > 0 else None
+        run = run + 1 if offset is not None and offset == previous else 1
+        previous = offset
+        if offset is not None and run >= 3:
+            return offset
+    return None
+
+
+def resolve_pdf_page(page_num, page_offset, *, page_map=None,
+                     front_offset=None, arabic_segments=None):
+    """One printed-page -> 1-based PDF mapping for outlines and public trees."""
+    if isinstance(page_num, int):
+        mapped = map_arabic_page(arabic_segments, page_num)
+        return mapped + 1 if mapped is not None else page_num + page_offset + 1
+    if isinstance(page_num, str):
+        mapped = map_page_num(page_map, page_num)
+        if mapped is not None:
+            return mapped + page_offset + 1
+        try:
+            return resolve_pdf_page(int(page_num), page_offset,
+                                    arabic_segments=arabic_segments)
+        except ValueError:
+            roman = _roman_to_int(page_num)
+            if roman is not None:
+                base = front_offset if front_offset is not None else page_offset
+                return roman + base + 1
+    return None
+
+
+def map_toc_pages(tree, page_offset, *, page_count, **mapping):
+    """Map an internal tree in place without leaking printed/string labels."""
+    for node in tree:
+        page = resolve_pdf_page(node.get("page_num"), page_offset, **mapping)
+        node["page_num"] = page if page is not None and 1 <= page <= page_count else None
+        map_toc_pages(node.get("children", []), page_offset,
+                      page_count=page_count, **mapping)

@@ -4,7 +4,6 @@ import gc
 import logging
 import os
 import re
-import statistics
 import tempfile
 import time
 from dataclasses import dataclass
@@ -33,8 +32,9 @@ from .page_map import (
     build_page_map,
     detect_roman_arabic_format,
     detect_segmented_offset,
-    map_arabic_page,
-    map_page_num,
+    find_text_page_offset,
+    resolve_pdf_page,
+    map_toc_pages,
 )
 from .parsing import (
     inherit_page_numbers,
@@ -139,25 +139,10 @@ def add_bookmarks_to_pdf(
 
     def _page_num_to_pdf(page_num: int | str | None) -> int | None:
         """Map a printed page number to a 1-based PDF page number (pymupdf convention)."""
-        if isinstance(page_num, int):
-            mapped = map_arabic_page(arabic_segments, page_num)
-            if mapped is not None:
-                return mapped + 1
-            return page_num + page_offset + 1
-        if isinstance(page_num, str):
-            mapped = map_page_num(page_map, page_num)
-            if mapped is not None:
-                return mapped + page_offset + 1
-            try:
-                return int(page_num) + page_offset + 1
-            except ValueError:
-                # front matter often uses lowercase Roman numerals ("vii")
-                r = _roman_to_int(page_num)
-                if r is not None:
-                    base = front_offset if front_offset is not None else page_offset
-                    return r + base + 1
-                return None
-        return None
+        return resolve_pdf_page(
+            page_num, page_offset, page_map=page_map,
+            front_offset=front_offset, arabic_segments=arabic_segments,
+        )
 
     def _first_page_num(node: dict) -> int | str | None:
         """Find the first valid page number in a subtree."""
@@ -484,8 +469,7 @@ def _bookmark_pdf_impl(
     # 布局检测完成后布局模型不再需要，显式释放：onnxruntime 的 CUDA arena 对
     # 动态 shape 会膨胀到数 GB 且不自动归还，与 OCR 模型的 session 叠加可撑爆
     # 6GB 显存导致推理变慢；del + gc 后 onnxruntime session 销毁会归还显存。
-    del layout_model
-    gc.collect()
+    # Keep layout available for adaptive body-page sampling after long prefaces.
 
     stage_start = time.perf_counter()
     if toc_strategy == "vllm":
@@ -552,8 +536,65 @@ def _bookmark_pdf_impl(
         cache_dir=cache_dir,
         pdf_hash=pdf_hash,
     )
-    page_offset = compute_page_offset(number_ocr_results)
-    _log_timing("calculate_page_offset", stage_start, candidate_pages=len(number_pages), kept_pages=len(kept_pages), ocr_pages=len(number_ocr_results), page_offset=page_offset)
+    page_offset = find_text_page_offset(doc, last_toc_page + 1)
+    if page_offset is None:
+        # Twenty pages after the TOC may still be Roman front matter. Extend
+        # scanned PDFs in bounded batches until Arabic labels agree on an
+        # offset, or a Roman-chapter page number format is identified.
+        sampling_end = len(page_imgs)
+        while True:
+            body_results = [
+                result
+                for result in number_ocr_results
+                if result["page"] > last_toc_page
+            ]
+            offsets = []
+            for result in body_results:
+                label = "".join(result["rec_texts"]).strip()
+                if re.fullmatch(r"[1-9]\d*", label):
+                    offsets.append(result["page"] - int(label))
+            has_stable_arabic_offset = (
+                offsets
+                and max(offsets.count(offset) for offset in set(offsets)) >= 3
+            )
+            if detect_roman_arabic_format(body_results) or has_stable_arabic_offset:
+                break
+            end = min(sampling_end + 20, last_toc_page + 201, doc.page_count)
+            if end <= sampling_end:
+                doc.close()
+                raise ValueError("Cannot determine body page numbering after the TOC")
+            imgs, results = layout_pages_in_range(
+                doc, layout_model, sampling_end, end,
+                cache_dir=cache_dir, pdf_hash=pdf_hash,
+            )
+            page_imgs.extend(imgs)
+            _, boxes, _ = extract_toc_and_number_pages(results, start=sampling_end)
+            number_pages.extend(boxes)
+            kept = get_number_box_pages(boxes, page_imgs)
+            number_ocr_results.extend(ocr_number_boxes(
+                kept, page_imgs, ocr_model, cache_dir=cache_dir, pdf_hash=pdf_hash,
+            ))
+            sampling_end = end
+        body_results = [
+            result
+            for result in number_ocr_results
+            if result["page"] > last_toc_page
+        ]
+        page_offset = compute_page_offset(body_results)
+        if not detect_roman_arabic_format(body_results) and not has_stable_arabic_offset:
+            doc.close()
+            raise ValueError("Cannot determine body page numbering after the TOC")
+    logger.info("Resolved body page offset: %s", page_offset)
+    del layout_model
+    gc.collect()
+    _log_timing(
+        "calculate_page_offset",
+        stage_start,
+        candidate_pages=len(number_pages),
+        kept_pages=len(kept_pages),
+        ocr_pages=len(number_ocr_results),
+        page_offset=page_offset,
+    )
     logger.debug(f"page_offset: {page_offset}")
     # front matter 偏移：有的书 front matter 用罗马页码（"vii"）、正文用阿拉伯
     # 数字（1, 2, ...），两套体系 offset 不同（如 Kibble：正文 offset 20，
@@ -673,15 +714,11 @@ def _bookmark_pdf_impl(
             ", ".join(skipped_titles[:10]),
         )
 
-    def update_page_offset(toc_tree1, page_offset):
-        for item in toc_tree1:
-            page_num = item["page_num"]
-            if isinstance(page_num, int):
-                item["page_num"] += page_offset + 1
-            if "children" in item:
-                update_page_offset(item["children"], page_offset)
-
-    update_page_offset(toc_tree1, page_offset)
+    map_toc_pages(
+        toc_tree1, page_offset, page_count=doc.page_count,
+        page_map=page_map, front_offset=front_offset,
+        arabic_segments=arabic_segments,
+    )
     end_time = time.perf_counter()
     time_cost = end_time - start_time
     logger.debug(f"process {Path(input).stem} cost: {time_cost:.2f} seconds")
