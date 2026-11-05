@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 # "I-28", "IV-3", ... (also tolerates OCR noise like "I_28", "I - 28",
 # and lowercase "l" misreads of "I")
 _ROMAN_ARABIC_RE = re.compile(r"^([IVXLCDMl]+)[-_]\s*(\d+)$")
+_ROMAN_PAGE_LABEL_RE = re.compile(
+    r"^m{0,3}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3})$"
+)
 
 
 def _normalize(text: str) -> str:
@@ -347,6 +350,14 @@ def _ocr_front_matter_page_numbers(
     if cached is not None:
         return cached["texts"]
 
+    text_labels = _text_layer_front_matter_page_numbers(doc[page_idx])
+    if text_labels:
+        logger.debug("front matter page %d: text-layer labels=%s", page_idx, text_labels)
+        if cache_path:
+            _cache_save(cache_path, {"texts": text_labels})
+        return text_labels
+
+    logger.debug("front matter page %d: no text-layer label; using OCR", page_idx)
     img = image_from_page(doc[page_idx])
     h, w = img.shape[:2]
     crops = [
@@ -365,6 +376,24 @@ def _ocr_front_matter_page_numbers(
     if cache_path:
         _cache_save(cache_path, {"texts": texts})
     return texts
+
+
+def _text_layer_front_matter_page_numbers(page) -> list[str]:
+    """Read printed page labels in the same edge regions used by OCR."""
+    width, height = page.rect.width, page.rect.height
+    labels = []
+    for word in page.get_text("words"):
+        x0, y0, x1, y1, raw = word[:5]
+        at_top_corner = y1 <= height * 0.12 and (x0 <= width * 0.35 or x1 >= width * 0.65)
+        at_bottom_edge = y0 >= height * 0.85
+        if not (at_top_corner or at_bottom_edge):
+            continue
+        label = raw.strip(".,;:()[] ")
+        # Only confidently readable Roman labels bypass OCR.  Digits in
+        # diagrams/headers can be unrelated to front-matter numbering.
+        if len(label) >= 2 and _ROMAN_PAGE_LABEL_RE.fullmatch(label):
+            labels.append(label)
+    return labels
 
 
 def build_front_matter_offset(

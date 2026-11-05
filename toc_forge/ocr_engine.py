@@ -7,6 +7,8 @@ import re
 import statistics
 import time
 
+import pymupdf
+
 from .utils import (
     CachedResult,
     NumpyEncoder,
@@ -307,6 +309,9 @@ def detect_toc_pages_by_keyword(
     if skip is None:
         skip = set()
     matched_pages = []
+    text_layer_candidates = 0
+    image_ocr_candidates = 0
+    cached_candidates = 0
     for page_idx, boxes in enumerate(all_boxes):
         if page_idx in skip or page_idx >= len(page_imgs):
             continue
@@ -339,9 +344,19 @@ def detect_toc_pages_by_keyword(
         cached = _cache_load(cache_path) if cache_path else None
         if cached is not None:
             cand_texts = cached["candidates"]
+            cached_candidates += len(cand_texts)
         else:
             cand_texts = []
             for b in candidates:
+                if document is not None and page_idx < len(document):
+                    text = _text_layer_candidate(document[page_idx], b, img.shape)
+                    if text is not None:
+                        text_layer_candidates += 1
+                        cand_texts.append({
+                            "coordinate": [float(c) for c in b["coordinate"]],
+                            "texts": [text],
+                        })
+                        continue
                 x1, y1, x2, y2 = b["coordinate"]
                 pad = 12
                 crop = img[
@@ -358,6 +373,7 @@ def detect_toc_pages_by_keyword(
                     crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC
                 )
                 result = ocr_model.predict(up)[0]
+                image_ocr_candidates += 1
                 cand_texts.append(
                     {
                         "coordinate": [float(c) for c in b["coordinate"]],
@@ -418,7 +434,32 @@ def detect_toc_pages_by_keyword(
                 "_text_layer_fallback": title_box is not None and not ocr_matched,
             }
         )
+    logger.debug(
+        "toc keyword detection: matched_pages=%d text_layer_candidates=%d image_ocr_candidates=%d cached_candidates=%d",
+        len(matched_pages), text_layer_candidates, image_ocr_candidates, cached_candidates,
+    )
     return matched_pages
+
+
+def _text_layer_candidate(page, box: dict, image_shape) -> str | None:
+    """Use a readable candidate heading before falling back to image OCR."""
+    h, w = image_shape[:2]
+    x1, y1, x2, y2 = box["coordinate"]
+    pad = 12
+    rect = pymupdf.Rect(
+        max(0, x1 - pad) * page.rect.width / w,
+        max(0, y1 - pad) * page.rect.height / h,
+        min(w, x2 + pad) * page.rect.width / w,
+        min(h, y2 + pad) * page.rect.height / h,
+    )
+    text = " ".join(page.get_text("text", clip=rect).split())
+    # OCR-backed PDF text layers can contain lookalike digits (C0NTENTS).
+    # Treat such mixed words as uncertain and keep the image OCR fallback.
+    if re.search(r"[A-Za-z]\d[A-Za-z]|\d[A-Za-z]\d|\ufffd", text):
+        return None
+    if re.search(r"[A-Za-z]{3,}|[\u4e00-\u9fff]{2,}", text):
+        return text
+    return None
 
 
 def _text_layer_toc_title(page, image_shape):
