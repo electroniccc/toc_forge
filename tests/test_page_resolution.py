@@ -9,6 +9,14 @@ from toc_forge.pipeline import add_bookmarks_to_pdf
 
 
 class PageResolutionTests(unittest.TestCase):
+    def test_early_page_uses_nearby_body_run_over_short_ocr_noise(self):
+        segments = [
+            {'printed_start': 14, 'printed_end': 15, 'pdf_start': 23},
+            {'printed_start': 0, 'printed_end': 2, 'pdf_start': 125},
+        ]
+        self.assertEqual(resolve_pdf_page(1, 9, arabic_segments=segments), 11)
+        self.assertEqual(resolve_pdf_page(22, 9, arabic_segments=segments), 32)
+
     def test_appendix_page_number_restart_does_not_override_body_segment(self):
         segments = [
             {'printed_start': 1, 'printed_end': 88, 'pdf_start': 17},

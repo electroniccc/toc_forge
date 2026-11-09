@@ -673,6 +673,20 @@ def resolve_pdf_page(page_num, page_offset, *, page_map=None,
     """One printed-page -> 1-based PDF mapping for outlines and public trees."""
     if isinstance(page_num, int):
         mapped = map_arabic_page(arabic_segments, page_num)
+        if mapped is not None and arabic_segments:
+            # A chapter's first printed page may have no readable page number.
+            # Short OCR runs elsewhere can falsely claim that page; prefer a
+            # nearby body run agreeing with the independently sampled offset.
+            covering = [s for s in arabic_segments if s["printed_start"] <= page_num <= s["printed_end"]]
+            strongest = max((s["printed_end"] - s["printed_start"] for s in covering), default=0)
+            nearby_baseline = any(
+                s["pdf_start"] - s["printed_start"] == page_offset
+                and s["printed_end"] - s["printed_start"] >= 1
+                and 0 < s["printed_start"] - page_num <= 32
+                for s in arabic_segments
+            )
+            if strongest <= 2 and nearby_baseline:
+                mapped = page_num + page_offset
         return mapped + 1 if mapped is not None else page_num + page_offset + 1
     if isinstance(page_num, str):
         mapped = map_page_num(page_map, page_num)
